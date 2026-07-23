@@ -17,9 +17,9 @@
  *   - Every function validates inputs before touching page tables.
  *   - Serial logging traces every operation for debugging.
  *
- * Current layout: identity-mapped (physical == virtual for kernel).
- * The VMM code is layout-agnostic — migrate to higher-half by changing
- * only the phys<->virt conversion in page_table.c.
+ * Higher-half layout: kernel linked at 0xFFFFFFFF80000000.  All
+ * kernel-physical addresses are accessed through pt_phys_to_virt().
+ * After all init, the identity map (PML4[0]) is removed.
  *
  * References:
  *   Intel SDM Vol.3A §4.5   — Paging structures
@@ -73,8 +73,8 @@ typedef enum {
  * Test VA Range
  *
  * A safe virtual address range for VMM tests.  This sits in user space
- * (lower half), within the identity-mapped first 1 GiB, and does not
- * conflict with the kernel image or boot structures.
+ * (lower half), in the PML4[1] region (512 GiB range) which is not
+ * shared with the kernel and not pre-mapped by boot page tables.
  *
  * Tests use addresses in [VMM_TEST_VA_BASE, VMM_TEST_VA_BASE + 8 MiB).
  * Each test allocates its own physical frames from the PMM and maps
@@ -221,6 +221,19 @@ address_space_t *vmm_get_kernel_address_space(void);
  * @return true if vmm_init() has been called, false otherwise.
  */
 bool vmm_is_initialized(void);
+
+/**
+ * @brief Unmap a virtual address and free the underlying physical frame.
+ *
+ * Combines vmm_unmap_page() with PMM frame release.  Walks the page
+ * tables to find the leaf PTE, extracts the physical address, frees the
+ * frame to the PMM, clears the PTE, and flushes TLB.
+ *
+ * @param as     Target address space.
+ * @param vaddr  Virtual address to unmap and free.
+ * @return VMM_OK on success, VMM_ERR_NOT_MAPPED if not mapped.
+ */
+vmm_status_t vmm_unmap_and_free(address_space_t *as, uint64_t vaddr);
 
 #ifdef __cplusplus
 }

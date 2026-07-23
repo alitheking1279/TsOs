@@ -3,7 +3,9 @@
 
 #include "../drivers/serial.h"
 
-#define TEST_MAX 128
+/* Raised from 256 → 512 to accommodate the full test suite.
+ * At 256 the registry silently drops any test registered after slot 255. */
+#define TEST_MAX 512
 
 typedef void (*test_fn)(serial_dev_t *dev);
 
@@ -50,6 +52,18 @@ static inline void _print_int(serial_dev_t *dev, int n) {
     }                                                       \
 } while (0)
 
+#define ASSERT_NEQ(dev, a, b) do {                         \
+    if ((a) == (b)) {                                      \
+        serial_write_string(dev, "FAIL ");                  \
+        serial_write_string(dev, __FILE__);                 \
+        serial_write_string(dev, ":");                      \
+        _print_int(dev, __LINE__);                          \
+        serial_write_string(dev, "\r\n");                   \
+        test_fail_flag = 1;                                 \
+        return;                                             \
+    }                                                       \
+} while (0)
+
 #define ASSERT_TRUE(dev, cond) do {                         \
     if (!(cond)) {                                          \
         serial_write_string(dev, "FAIL ");                  \
@@ -64,6 +78,18 @@ static inline void _print_int(serial_dev_t *dev, int n) {
 
 #define ASSERT_NOT_NULL(dev, ptr) do {                      \
     if ((ptr) == 0) {                                       \
+        serial_write_string(dev, "FAIL ");                  \
+        serial_write_string(dev, __FILE__);                 \
+        serial_write_string(dev, ":");                      \
+        _print_int(dev, __LINE__);                          \
+        serial_write_string(dev, "\r\n");                   \
+        test_fail_flag = 1;                                 \
+        return;                                             \
+    }                                                       \
+} while (0)
+
+#define ASSERT_NULL(dev, ptr) do {                          \
+    if ((ptr) != 0) {                                       \
         serial_write_string(dev, "FAIL ");                  \
         serial_write_string(dev, __FILE__);                 \
         serial_write_string(dev, ":");                      \

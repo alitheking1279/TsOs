@@ -1,6 +1,6 @@
 /**
  * @file test_vmm.c
- * @brief Virtual Memory Manager test suite — 72 tests across 10 groups.
+ * @brief Virtual Memory Manager test suite — 75 tests across 11 groups.
  *
  * Test philosophy
  * ===============
@@ -23,6 +23,7 @@
  * Group H — Error Conditions & Edge Cases (8 tests)
  * Group I — Intermediate Table Cleanup After Unmap (4 tests)
  * Group J — Copy-on-Write (3 tests)
+ * Group K — Unmap Range Validation & Huge Page Translate (3 tests)
  */
 
 #include "test.h"
@@ -285,8 +286,9 @@ static void test_map_kernel_space(serial_dev_t *dev) {
     uint64_t paddr = pmm_alloc_frame();
     ASSERT_TRUE(dev, paddr != 0);
 
-    /* Map a kernel-range VA — this should work since it's the kernel space. */
-    uint64_t vaddr = 0xFFFFFFFF80100000ULL;  /* high kernel range */
+    /* Map a kernel-range VA — PML4[511], PDPT[256] is not mapped by
+     * boot page tables, so this tests mapping into kernel virtual space. */
+    uint64_t vaddr = 0xFFFFFFFF40000000ULL;  /* upper-half, unmapped */
     vmm_status_t st = vmm_map_page(vmm_get_kernel_address_space(), vaddr, paddr, VMM_FLAG_WRITE);
     ASSERT_EQ(dev, (int)st, (int)VMM_OK);
 
@@ -366,11 +368,12 @@ static void test_unmap_range(serial_dev_t *dev) {
     reset_test_va();
     int count = 8;
     uint64_t vbase = alloc_test_va(count);
+    uint64_t paddrs[8];
 
     for (int i = 0; i < count; i++) {
-        uint64_t p = pmm_alloc_frame();
-        ASSERT_TRUE(dev, p != 0);
-        vmm_map_page(vmm_get_kernel_address_space(), vbase + i * PAGE_SIZE, p, VMM_FLAG_WRITE);
+        paddrs[i] = pmm_alloc_frame();
+        ASSERT_TRUE(dev, paddrs[i] != 0);
+        vmm_map_page(vmm_get_kernel_address_space(), vbase + i * PAGE_SIZE, paddrs[i], VMM_FLAG_WRITE);
     }
 
     /* Unmap the entire range in one call. */
@@ -384,12 +387,9 @@ static void test_unmap_range(serial_dev_t *dev) {
                                       vbase + i * PAGE_SIZE), (uint64_t)0);
     }
 
-    /* Free physical frames. */
+    /* Free physical frames (saved before unmap). */
     for (int i = 0; i < count; i++) {
-        /* Translating returns 0, so we can't recover the phys addr.
-         * This is a limitation of the simple test — in a real OS,
-         * the VMM tracks allocated frames.  For now, just skip the free
-         * since the frames are lost.  The PMM stats will reflect the leak. */
+        pmm_free_frame(paddrs[i]);
     }
 }
 
@@ -510,8 +510,9 @@ static void test_create_multiple_spaces(serial_dev_t *dev) {
         ASSERT_EQ(dev, (int)vmm_create_address_space(&as[i]), (int)VMM_OK);
         ASSERT_NOT_NULL(dev, as[i].pml4);
 
-        /* Each should have the identity mapping (entry 0) from kernel. */
-        ASSERT_TRUE(dev, as[i].pml4[0] != 0);
+        /* Each should have a kernel-mapped upper half (entry 511+). */
+        uint64_t kernel_entry = as[i].pml4[511];
+        ASSERT_TRUE(dev, kernel_entry != 0);
     }
 
     /* All have different PML4 physical addresses. */
@@ -1294,42 +1295,150 @@ static void test_clone_cow_three_way(serial_dev_t *dev) {
     vmm_map_page(vmm_get_kernel_address_space(), vaddr, paddr, VMM_FLAG_WRITE);
     *(volatile uint64_t *)vaddr = 0xAAAA;
 
-    /* Clone kernel -> as1, then clone as1 -> as2. */
+    /* Clone kernel -> as1, then clone as1 -> as2.
+     * Standard COW semantics: after clone, pages are shared (COW-flagged).
+     * Frames are not duplicated until a write triggers a COW fault. */
     address_space_t as1, as2;
     vmm_create_address_space(&as1);
     vmm_create_address_space(&as2);
     vmm_clone_address_space(vmm_get_kernel_address_space(), &as1);
     vmm_clone_address_space(&as1, &as2);
 
-    /* Write in as2 — should not affect as1 or kernel. */
+    /* Write in as2 — triggers COW fault, as2 gets its own private frame.
+     * kernel and as1 remain COW-shared on the original paddr. */
     vmm_switch_address_space(&as2);
     *(volatile uint64_t *)vaddr = 0xBBBB;
     vmm_switch_address_space(vmm_get_kernel_address_space());
 
-    /* Kernel still has original. */
+    /* Kernel still has original value (COW-shared with as1). */
     ASSERT_EQ(dev, *(volatile uint64_t *)vaddr, (uint64_t)0xAAAA);
 
-    /* as1 still has original (COW not triggered — only read). */
+    /* as1 still has original value (no write occurred in as1). */
     vmm_switch_address_space(&as1);
     ASSERT_EQ(dev, *(volatile uint64_t *)vaddr, (uint64_t)0xAAAA);
     vmm_switch_address_space(vmm_get_kernel_address_space());
 
-    /* All three should have different physical frames. */
-    uint64_t k_phys = vmm_translate(vmm_get_kernel_address_space(), vaddr);
+    /* Check physical frame layout:
+     *   - kernel and as1 share paddr (COW, no write triggered)
+     *   - as2 got a private copy (write triggered COW resolution) */
+    uint64_t k_phys  = vmm_translate(vmm_get_kernel_address_space(), vaddr);
     uint64_t a1_phys = vmm_translate(&as1, vaddr);
     uint64_t a2_phys = vmm_translate(&as2, vaddr);
-    ASSERT_TRUE(dev, k_phys != a1_phys);
-    ASSERT_TRUE(dev, k_phys != a2_phys);
-    ASSERT_TRUE(dev, a1_phys != a2_phys);
+
+    /* kernel and as1 correctly share the original frame. */
+    ASSERT_EQ(dev, k_phys, paddr);
+    ASSERT_EQ(dev, a1_phys, paddr);
+
+    /* as2 has an independent frame (COW was resolved on write). */
+    ASSERT_TRUE(dev, a2_phys != 0);
+    ASSERT_TRUE(dev, a2_phys != paddr);
+
+    /* as2's frame holds the written value (0xBBBB). */
+    vmm_switch_address_space(&as2);
+    ASSERT_EQ(dev, *(volatile uint64_t *)vaddr, (uint64_t)0xBBBB);
+    vmm_switch_address_space(vmm_get_kernel_address_space());
 
     vmm_unmap_page(vmm_get_kernel_address_space(), vaddr);
     vmm_unmap_page(&as1, vaddr);
     vmm_unmap_page(&as2, vaddr);
-    pmm_free_frame(paddr);
-    pmm_free_frame(a1_phys);
-    pmm_free_frame(a2_phys);
+    pmm_free_frame(paddr);     /* original frame — shared by kernel and as1 */
+    pmm_free_frame(a2_phys);   /* as2's private frame from COW resolution  */
     vmm_destroy_address_space(&as1);
     vmm_destroy_address_space(&as2);
+}
+
+/* =========================================================================
+ * Group K — Unmap Range Validation & Huge Page Translate
+ * ========================================================================= */
+
+/**
+ * K1: vmm_unmap_range rejects start >= end (same address or reversed).
+ */
+static void test_unmap_range_start_ge_end(serial_dev_t *dev) {
+    reset_test_va();
+    uint64_t base = alloc_test_va(2);
+    vmm_status_t st;
+
+    /* start == end → invalid */
+    st = vmm_unmap_range(vmm_get_kernel_address_space(), base, base);
+    ASSERT_EQ(dev, (int)st, (int)VMM_ERR_INVALID);
+
+    /* start > end → invalid */
+    st = vmm_unmap_range(vmm_get_kernel_address_space(), base + PAGE_SIZE, base);
+    ASSERT_EQ(dev, (int)st, (int)VMM_ERR_INVALID);
+}
+
+/**
+ * K2: vmm_unmap_range rejects misaligned start or end.
+ */
+static void test_unmap_range_misaligned(serial_dev_t *dev) {
+    reset_test_va();
+    uint64_t base = alloc_test_va(2);
+    vmm_status_t st;
+
+    /* Misaligned start */
+    st = vmm_unmap_range(vmm_get_kernel_address_space(), base + 0x100,
+                         base + 2 * PAGE_SIZE);
+    ASSERT_EQ(dev, (int)st, (int)VMM_ERR_INVALID);
+
+    /* Misaligned end */
+    st = vmm_unmap_range(vmm_get_kernel_address_space(), base,
+                         base + PAGE_SIZE + 0x100);
+    ASSERT_EQ(dev, (int)st, (int)VMM_ERR_INVALID);
+}
+
+/**
+ * K3: vmm_translate resolves a 2 MiB huge-page PD entry.
+ *
+ * Maps a normal 4 KiB page to build the page table hierarchy, then
+ * overwrites the PD entry with a PS (huge page) bit set, and verifies
+ * vmm_translate walks through it correctly.
+ */
+static void test_translate_huge_page(serial_dev_t *dev) {
+    reset_test_va();
+    address_space_t *kern = vmm_get_kernel_address_space();
+    uint64_t vaddr = alloc_test_va(1);
+    uint64_t paddr = pmm_alloc_frame();
+    ASSERT_TRUE(dev, paddr != 0);
+
+    /* Map normally to build the PML4→PDPT→PD→PT chain. */
+    vmm_status_t st = vmm_map_page(kern, vaddr, paddr, VMM_FLAG_WRITE);
+    ASSERT_EQ(dev, (int)st, (int)VMM_OK);
+
+    /* Verify normal 4 KiB translation works. */
+    ASSERT_EQ(dev, vmm_translate(kern, vaddr), paddr);
+
+    /* Walk to the PD entry for this vaddr. */
+    uint64_t pml4e = kern->pml4[PML4_INDEX(vaddr)];
+    uint64_t *pdpt = (uint64_t *)pt_phys_to_virt(pte_addr(pml4e));
+    uint64_t pdpe = pdpt[PDPT_INDEX(vaddr)];
+    uint64_t *pd = (uint64_t *)pt_phys_to_virt(pte_addr(pdpe));
+    int pd_idx = PD_INDEX(vaddr);
+
+    /* Save the original 4 KiB PD entry. */
+    uint64_t orig_pde = pd[pd_idx];
+
+    /* Build a 2 MiB huge page PD entry.  The physical base must be
+     * 2 MiB-aligned; we use the 2 MiB-aligned version of our frame. */
+    uint64_t huge_phys = paddr & ~0x1FFFFFULL;
+    uint64_t huge_pde  = huge_phys | PTE_PRESENT | PTE_WRITABLE | PTE_PS;
+    pd[pd_idx] = huge_pde;
+    pt_invlpg((void *)vaddr);
+
+    /* Translate: should use the 2 MiB huge page path. */
+    uint64_t offset  = vaddr & 0x1FFFFFULL;
+    uint64_t result  = vmm_translate(kern, vaddr);
+    serial_write_string(dev, "[VMM TEST] translate_huge_page: result=");
+    t_hex64(dev, result); serial_write_string(dev, " expected=");
+    t_hex64(dev, huge_phys + offset); serial_write_string(dev, "\r\n");
+    ASSERT_EQ(dev, result, huge_phys + offset);
+
+    /* Restore the original PD entry so the normal cleanup path works. */
+    pd[pd_idx] = orig_pde;
+    pt_invlpg((void *)vaddr);
+
+    vmm_unmap_page(kern, vaddr);
+    pmm_free_frame(paddr);
 }
 
 /* =========================================================================
@@ -1424,4 +1533,9 @@ void test_register_vmm(void) {
     test_register("clone_cow_basic",         test_clone_cow_basic);
     test_register("clone_cow_both_write",    test_clone_cow_both_write);
     test_register("clone_cow_three_way",     test_clone_cow_three_way);
+
+    /* Group K: Unmap Range Validation & Huge Page Translate */
+    test_register("unmap_range_start_ge_end", test_unmap_range_start_ge_end);
+    test_register("unmap_range_misaligned",   test_unmap_range_misaligned);
+    test_register("translate_huge_page",      test_translate_huge_page);
 }

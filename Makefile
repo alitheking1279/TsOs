@@ -31,7 +31,8 @@ BUILD   = build
 # and avoid collisions in the flat build dir.
 ASM_SOURCES = src/boot/boot.asm \
               src/kernel/gdt_flush.asm \
-              src/kernel/isr_stubs.asm
+              src/kernel/isr_stubs.asm \
+              src/kernel/context_switch.asm
 
 # C sources — pattern rules below match by source directory.
 C_SOURCES   = src/kernel/main.c \
@@ -42,7 +43,19 @@ C_SOURCES   = src/kernel/main.c \
               src/kernel/pmm.c \
               src/kernel/page_table.c \
               src/kernel/vmm.c \
+              src/kernel/kheap.c \
+              src/kernel/panic.c \
+              src/kernel/spinlock.c \
+              src/kernel/slab.c \
+              src/kernel/pmm_buddy.c \
+              src/kernel/mem_stats.c \
+              src/drivers/pit.c \
+              src/kernel/timer.c \
+              src/kernel/task.c \
+              src/kernel/scheduler.c \
+              src/kernel/mlfq.c \
               src/lib/string.c \
+              src/lib/print.c \
               src/drivers/serial.c \
               src/tests/test.c \
               src/tests/test_serial.c \
@@ -50,7 +63,19 @@ C_SOURCES   = src/kernel/main.c \
               src/tests/test_gdt.c \
               src/tests/test_idt.c \
               src/tests/test_pmm.c \
-              src/tests/test_vmm.c
+              src/tests/test_vmm.c \
+              src/tests/test_kheap.c \
+              src/tests/test_slab.c \
+              src/tests/test_spinlock.c \
+              src/tests/test_panic.c \
+              src/tests/test_pit.c \
+              src/tests/test_timer.c \
+              src/tests/test_task.c \
+              src/tests/test_context_switch.c \
+              src/tests/test_scheduler.c \
+              src/tests/test_spinlock_rflags.c \
+              src/tests/test_mlfq.c \
+              src/tests/test_zombie.c
 
 # -----------------------------------------------------------------------------
 # Object lists
@@ -61,7 +86,8 @@ C_SOURCES   = src/kernel/main.c \
 # -----------------------------------------------------------------------------
 ASM_OBJECTS = $(BUILD)/boot.o \
               $(BUILD)/gdt_asm.o \
-              $(BUILD)/isr_stubs_asm.o
+              $(BUILD)/isr_stubs_asm.o \
+              $(BUILD)/context_switch_asm.o
 
 C_OBJECTS   = $(BUILD)/main.o \
               $(BUILD)/gdt.o \
@@ -71,7 +97,19 @@ C_OBJECTS   = $(BUILD)/main.o \
               $(BUILD)/pmm.o \
               $(BUILD)/page_table.o \
               $(BUILD)/vmm.o \
+              $(BUILD)/kheap.o \
+              $(BUILD)/panic.o \
+              $(BUILD)/spinlock.o \
+              $(BUILD)/slab.o \
+              $(BUILD)/pmm_buddy.o \
+              $(BUILD)/mem_stats.o \
+              $(BUILD)/pit.o \
+              $(BUILD)/timer.o \
+              $(BUILD)/task.o \
+              $(BUILD)/scheduler.o \
+              $(BUILD)/mlfq.o \
               $(BUILD)/string.o \
+              $(BUILD)/print.o \
               $(BUILD)/serial.o \
               $(BUILD)/test.o \
               $(BUILD)/test_serial.o \
@@ -79,7 +117,19 @@ C_OBJECTS   = $(BUILD)/main.o \
               $(BUILD)/test_gdt.o \
               $(BUILD)/test_idt.o \
               $(BUILD)/test_pmm.o \
-              $(BUILD)/test_vmm.o
+              $(BUILD)/test_vmm.o \
+              $(BUILD)/test_kheap.o \
+              $(BUILD)/test_slab.o \
+              $(BUILD)/test_spinlock.o \
+              $(BUILD)/test_panic.o \
+              $(BUILD)/test_pit.o \
+              $(BUILD)/test_timer.o \
+              $(BUILD)/test_task.o \
+              $(BUILD)/test_context_switch.o \
+              $(BUILD)/test_scheduler.o \
+              $(BUILD)/test_spinlock_rflags.o \
+              $(BUILD)/test_mlfq.o \
+              $(BUILD)/test_zombie.o
 
 OBJECTS = $(ASM_OBJECTS) $(C_OBJECTS)
 
@@ -100,9 +150,9 @@ TsOs.iso: $(OBJECTS)
 #   -display none        headless (no VGA window)
 #   -no-reboot           on triple-fault, exit instead of loop
 test: TsOs.iso
-	qemu-system-x86_64 -cdrom TsOs.iso -nographic \
+	qemu-system-x86_64 -cdrom TsOs.iso \
 	    -serial stdio -serial null \
-	    -display none -no-reboot
+	    -display none -no-reboot -accel tcg
 
 run: TsOs.iso
 	qemu-system-x86_64 -cdrom TsOs.iso -serial stdio -serial null
@@ -122,6 +172,11 @@ $(BUILD)/gdt_asm.o: src/kernel/gdt_flush.asm
 
 # isr_stubs.asm builds to isr_stubs_asm.o so it doesn't collide with isr.c -> isr.o
 $(BUILD)/isr_stubs_asm.o: src/kernel/isr_stubs.asm
+	@mkdir -p $(BUILD)
+	$(ASM) $(ASMFLAGS) $< -o $@
+
+# context_switch.asm builds to context_switch_asm.o
+$(BUILD)/context_switch_asm.o: src/kernel/context_switch.asm
 	@mkdir -p $(BUILD)
 	$(ASM) $(ASMFLAGS) $< -o $@
 

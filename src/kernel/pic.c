@@ -18,28 +18,10 @@
  */
 
 #include "pic.h"
+#include "../drivers/portio.h"
 
-/* ---- Low-level port I/O ------------------------------------------------
- * Defined locally to avoid coupling with the serial driver, which defines
- * its own identical static inline versions.  In a larger kernel these
- * would live in a shared <portio.h>. */
-
-static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
-
-/** Delay required by the 8259A datasheet between consecutive ICW writes.
- *  Writing to port 0x80 (BIOS POST diagnostic port) burns ~1 microsecond
- *  on real hardware.  Harmless on QEMU but critical for bare-metal. */
-static inline void pic_io_delay(void) {
-    outb(0x80, 0);
-}
+/** Delay required by the 8259A datasheet between consecutive ICW writes. */
+#define pic_io_delay() io_wait()
 
 /* ---- Helper: determine which PIC owns an IRQ line --------------------- */
 

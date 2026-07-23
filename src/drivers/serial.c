@@ -13,6 +13,7 @@
  */
 
 #include "serial.h"
+#include "portio.h"
 
 /* ---- Register offsets (relative to port base) ------------------------- */
 #define REG_DATA        0 /**< DLAB=0: RBR (read) / THR (write) */
@@ -71,18 +72,6 @@
  *  a calibrated time value -- there is no timer dependency here, which
  *  matters because this driver may run before any timer is set up. */
 #define POLL_RETRY_LIMIT         100000
-
-/* ---- Low-level port I/O ------------------------------------------------*/
-
-static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ volatile ( "outb %0, %1" : : "a"(val), "Nd"(port) );
-}
-
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    __asm__ volatile ( "inb %1, %0" : "=a"(ret) : "Nd"(port) );
-    return ret;
-}
 
 /* ---- Internal helpers ----------------------------------------------------
  * These take the raw base address rather than serial_dev_t so serial_init()

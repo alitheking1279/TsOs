@@ -70,6 +70,7 @@ isr%1:
 ; =============================================================================
 
 isr_common:
+    swapgs                          ; Switch to kernel GS-base on entry
     push rax
     push rbx
     push rcx
@@ -86,6 +87,7 @@ isr_common:
     push r14
     push r15
 
+    cld                         ; Clear direction flag — SDM requires DF=0 for string ops in C
     mov rdi, rsp                ; rdi = pointer to interrupt_frame_t
     call isr_common_handler
 
@@ -106,6 +108,7 @@ isr_common:
     pop rax
 
     add rsp, 16                 ; skip vector + error_code
+    swapgs                          ; Restore user GS-base before returning
     iretq
 
 ; =============================================================================

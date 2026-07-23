@@ -49,6 +49,8 @@
  */
 
 #include "pmm.h"
+#include "page_table.h"
+#include "spinlock.h"
 #include "../drivers/serial.h"
 #include <stdint.h>
 
@@ -71,6 +73,9 @@ static uint64_t g_total_frames;              /* highest frame index + 1   */
 static uint64_t g_free_frames;
 static uint64_t g_reserved_frames;
 static int      g_initialized;               /* set to 1 after pmm_init() */
+
+/* Spinlock protecting the bitmap and free-frame counter for SMP safety. */
+static spinlock_t g_pmm_lock;
 
 /* Serial device pointer for logging (may be NULL). */
 static serial_dev_t *g_serial;
@@ -157,11 +162,16 @@ static inline uint64_t _frame_to_addr(uint64_t frame) {
  *   last  frame = floor((base_addr + length) / PAGE_SIZE) - 1
  */
 static void _mark_range_free(uint64_t base_addr, uint64_t length) {
+    /* Guard against overflow: if base_addr + length wraps, clamp to max. */
+    if (length == 0) return;
+    uint64_t end_addr = base_addr + length;
+    if (end_addr < base_addr) end_addr = UINT64_MAX;
+
     /* Round base up, end down — only free complete pages inside the region. */
     uint64_t first = (base_addr + PAGE_SIZE - 1) >> PAGE_SHIFT;
-    uint64_t end   = (base_addr + length) >> PAGE_SHIFT;
+    uint64_t end   = end_addr >> PAGE_SHIFT;
 
-    if (end > PMM_MAX_FRAMES) end = PMM_MAX_FRAMES;
+    if (end > g_total_frames) end = g_total_frames;
     if (first >= end) return;
 
     for (uint64_t f = first; f < end; f++) {
@@ -177,10 +187,15 @@ static void _mark_range_free(uint64_t base_addr, uint64_t length) {
  * Clamps to PMM_MAX_FRAMES.
  */
 static void _mark_range_used(uint64_t base_addr, uint64_t length) {
-    uint64_t first = base_addr >> PAGE_SHIFT;
-    uint64_t end   = ((base_addr + length + PAGE_SIZE - 1) >> PAGE_SHIFT);
+    /* Guard against overflow: if base_addr + length wraps, clamp to max. */
+    if (length == 0) return;
+    uint64_t end_addr = base_addr + length;
+    if (end_addr < base_addr) end_addr = UINT64_MAX;
 
-    if (end > PMM_MAX_FRAMES) end = PMM_MAX_FRAMES;
+    uint64_t first = base_addr >> PAGE_SHIFT;
+    uint64_t end   = (end_addr + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+    if (end > g_total_frames) end = g_total_frames;
     if (first >= end) return;
 
     for (uint64_t f = first; f < end; f++) {
@@ -207,6 +222,7 @@ static inline uint64_t _mb2_align8(uint64_t v) {
 
 void pmm_init(uint32_t mb2_info_phys, void *serial) {
     g_serial = (serial_dev_t *)serial;
+    spinlock_init(&g_pmm_lock);
 
     pmm_log_str("\r\n[PMM] ============================================\r\n");
     pmm_log_str("[PMM] Physical Memory Manager initializing...\r\n");
@@ -226,7 +242,8 @@ void pmm_init(uint32_t mb2_info_phys, void *serial) {
         return;
     }
 
-    uint64_t mb2_addr = (uint64_t)mb2_info_phys;
+    uint64_t mb2_phys = (uint64_t)mb2_info_phys;
+    uint64_t mb2_addr = (uint64_t)pt_phys_to_virt(mb2_phys);
     mb2_header_t *hdr = (mb2_header_t *)mb2_addr;
 
     pmm_log_str("[PMM] Multiboot2 info @ ");
@@ -311,8 +328,8 @@ void pmm_init(uint32_t mb2_info_phys, void *serial) {
     pmm_log_str("[PMM] Frame 0 reserved (BIOS IVT/BDA).\r\n");
 
     /* ---- Step 4: Re-reserve the kernel image. ---- */
-    uint64_t ks = (uint64_t)(uintptr_t)_kernel_start;
-    uint64_t ke = (uint64_t)(uintptr_t)_kernel_end;
+    uint64_t ks = (uint64_t)(uintptr_t)_kernel_start - HIGHER_HALF_OFFSET;
+    uint64_t ke = (uint64_t)(uintptr_t)_kernel_end - HIGHER_HALF_OFFSET;
     pmm_log_str("[PMM] Kernel image: ");
     pmm_log_hex64(ks);
     pmm_log_str(" - ");
@@ -322,7 +339,7 @@ void pmm_init(uint32_t mb2_info_phys, void *serial) {
     pmm_log_str("[PMM] Kernel image reserved.\r\n");
 
     /* ---- Step 5: Re-reserve the PMM bitmap itself. ---- */
-    uint64_t bmap_start = (uint64_t)(uintptr_t)g_bitmap;
+    uint64_t bmap_start = (uint64_t)(uintptr_t)g_bitmap - HIGHER_HALF_OFFSET;
     uint64_t bmap_size  = (uint64_t)sizeof(g_bitmap);
     pmm_log_str("[PMM] Bitmap: ");
     pmm_log_hex64(bmap_start);
@@ -348,7 +365,13 @@ void pmm_init(uint32_t mb2_info_phys, void *serial) {
 uint64_t pmm_alloc_frame(void) {
     if (!g_initialized) return 0;
 
-    uint64_t n_words = g_total_frames / PMM_BITS_PER_WORD;
+    uint64_t pmm_rflags = spin_lock(&g_pmm_lock);
+
+    /* Ceiling division: include the last partial word so every frame
+     * within [0, g_total_frames) is reachable.  The old truncating
+     * division silently made frames in the last partial word
+     * permanently unallocatable (silent memory loss). */
+    uint64_t n_words = (g_total_frames + PMM_BITS_PER_WORD - 1) / PMM_BITS_PER_WORD;
     if (n_words == 0) n_words = 1;
 
     for (uint64_t w = 0; w < n_words; w++) {
@@ -357,19 +380,38 @@ uint64_t pmm_alloc_frame(void) {
         /* At least one bit is 0 (free). Find lowest free bit. */
         uint64_t free_bits = ~g_bitmap[w];           /* 1 = free now */
 
-        /* Fix 3: Frame 0 (bit 0 of word 0) must NEVER be allocated.
+        /* Frame 0 (bit 0 of word 0) must NEVER be allocated.
          * Mask it out structurally so __builtin_ctzll can never pick it,
          * even if the bitmap bit were somehow cleared by a bug. */
         if (w == 0) free_bits &= ~(uint64_t)1;
-        if (free_bits == 0) continue;                /* only frame 0 was free */
+
+        /* For the last (potentially partial) word, mask out bits that
+         * correspond to frame indices >= g_total_frames to prevent
+         * returning an out-of-range address. */
+        if (w == n_words - 1) {
+            uint64_t valid_bits = g_total_frames % PMM_BITS_PER_WORD;
+            if (valid_bits != 0) {
+                /* Only bits [0, valid_bits) are real frames. */
+                free_bits &= ((uint64_t)1 << valid_bits) - 1;
+            }
+            /* If valid_bits == 0, the word is exactly full — no masking needed. */
+        }
+
+        if (free_bits == 0) continue;
 
         int bit = __builtin_ctzll(free_bits);        /* index of lowest set bit */
         uint64_t frame = w * PMM_BITS_PER_WORD + (uint64_t)bit;
 
-        if (frame >= g_total_frames) return 0;       /* out of range */
+        /* Hard guard — should never trigger with the mask above. */
+        if (frame >= g_total_frames) {
+            spin_unlock(&g_pmm_lock, pmm_rflags);
+            return 0;
+        }
 
         _set_used(frame);
         g_free_frames--;
+
+        spin_unlock(&g_pmm_lock, pmm_rflags);
 
         uint64_t addr = _frame_to_addr(frame);
         pmm_log_str("[PMM] ALLOC frame ");
@@ -380,6 +422,8 @@ uint64_t pmm_alloc_frame(void) {
         return addr;
     }
 
+    spin_unlock(&g_pmm_lock, pmm_rflags);
+
     pmm_log_str("[PMM] ALLOC failed: OOM\r\n");
     return 0;  /* OOM */
 }
@@ -387,6 +431,18 @@ uint64_t pmm_alloc_frame(void) {
 uint64_t pmm_alloc_frames(uint64_t count) {
     if (!g_initialized || count == 0) return 0;
     if (count == 1) return pmm_alloc_frame();
+
+    uint64_t pmm_rflags = spin_lock(&g_pmm_lock);
+
+    if (count > g_free_frames) {
+        spin_unlock(&g_pmm_lock, pmm_rflags);
+        pmm_log_str("[PMM] ALLOC_CONTIG failed: requested ");
+        pmm_log_uint64(count);
+        pmm_log_str(" but only ");
+        pmm_log_uint64(g_free_frames);
+        pmm_log_str(" free\r\n");
+        return 0;
+    }
 
     /* Find first run of `count` contiguous free frames. */
     uint64_t run_start = 0;
@@ -402,6 +458,9 @@ uint64_t pmm_alloc_frames(uint64_t count) {
                     _set_used(i);
                     g_free_frames--;
                 }
+
+                spin_unlock(&g_pmm_lock, pmm_rflags);
+
                 uint64_t addr = _frame_to_addr(run_start);
                 pmm_log_str("[PMM] ALLOC_CONTIG ");
                 pmm_log_uint64(count);
@@ -417,6 +476,8 @@ uint64_t pmm_alloc_frames(uint64_t count) {
         }
     }
 
+    spin_unlock(&g_pmm_lock, pmm_rflags);
+
     pmm_log_str("[PMM] ALLOC_CONTIG failed: no ");
     pmm_log_uint64(count);
     pmm_log_str(" contiguous frames available\r\n");
@@ -428,9 +489,12 @@ pmm_status_t pmm_free_frame(uint64_t addr) {
     if (addr & (PAGE_SIZE - 1))   return PMM_ERR_INVALID;   /* misaligned */
 
     uint64_t frame = _addr_to_frame(addr);
-    if (frame == 0 || frame >= PMM_MAX_FRAMES) return PMM_ERR_INVALID;
+    if (frame == 0 || frame >= g_total_frames) return PMM_ERR_INVALID;
+
+    uint64_t pmm_rflags = spin_lock(&g_pmm_lock);
 
     if (!_is_used(frame)) {
+        spin_unlock(&g_pmm_lock, pmm_rflags);
         pmm_log_str("[PMM] DOUBLE-FREE detected @ ");
         pmm_log_hex64(addr);
         pmm_log_str("\r\n");
@@ -439,6 +503,8 @@ pmm_status_t pmm_free_frame(uint64_t addr) {
 
     _set_free(frame);
     g_free_frames++;
+
+    spin_unlock(&g_pmm_lock, pmm_rflags);
 
     pmm_log_str("[PMM] FREE  frame ");
     pmm_log_uint64(frame);
@@ -451,11 +517,13 @@ pmm_status_t pmm_free_frame(uint64_t addr) {
 void pmm_mark_used(uint64_t addr) {
     if (addr & (PAGE_SIZE - 1)) return;
     uint64_t frame = _addr_to_frame(addr);
-    if (frame >= PMM_MAX_FRAMES) return;
+    if (frame >= g_total_frames) return;
+    uint64_t pmm_rflags = spin_lock(&g_pmm_lock);
     if (!_is_used(frame)) {
         _set_used(frame);
         g_free_frames--;
     }
+    spin_unlock(&g_pmm_lock, pmm_rflags);
 }
 
 void pmm_mark_free(uint64_t addr) {
@@ -465,17 +533,19 @@ void pmm_mark_free(uint64_t addr) {
      * Silently ignore any attempt to free it — this is a hard invariant
      * that must hold regardless of how the caller obtained `addr`. */
     if (frame == 0) return;
-    if (frame >= PMM_MAX_FRAMES) return;
+    if (frame >= g_total_frames) return;
+    uint64_t pmm_rflags = spin_lock(&g_pmm_lock);
     if (_is_used(frame)) {
         _set_free(frame);
         g_free_frames++;
     }
+    spin_unlock(&g_pmm_lock, pmm_rflags);
 }
 
 int pmm_is_free(uint64_t addr) {
     if (addr & (PAGE_SIZE - 1)) return -1;
     uint64_t frame = _addr_to_frame(addr);
-    if (frame >= PMM_MAX_FRAMES) return -1;
+    if (frame >= g_total_frames) return -1;
     return _is_used(frame) ? 0 : 1;
 }
 

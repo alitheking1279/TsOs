@@ -270,25 +270,54 @@ static inline bool is_page_aligned(uint64_t addr) {
 }
 
 /* =========================================================================
+ * Kernel Heap Virtual Address Range
+ *
+ * The heap occupies a fixed VA region in kernel space, demand-paged:
+ *   HEAP_BASE = 0xFFFFFFFFC0000000  (PML4[511] → PDPT[510] → PD[256])
+ *   HEAP_END  = HEAP_BASE + 16 MiB  (4096 pages)
+ *
+ * This sits in PDPT[510] (the same PDPT that holds the kernel code at
+ * PD[0-127]), but at PD[256] which is far above the kernel image.
+ * The PD[0] 2 MiB huge page from boot is replaced with a normal PD
+ * table on the first heap page fault — safe because the identity map
+ * (PML4[0]) has already been removed and the kernel code lives at
+ * PD[128+] (0xFFFFFFFF80200000+).
+ *
+ * All heap pages are demand-paged (PTE_DEMAND): no physical frames are
+ * allocated until the first access, which triggers a page fault that
+ * allocates a frame and installs the mapping.
+ * ========================================================================= */
+
+#define HEAP_BASE       0xFFFFFFFFC0000000ULL
+#define HEAP_SIZE       (16ULL * 1024 * 1024)   /* 16 MiB */
+#define HEAP_END        (HEAP_BASE + HEAP_SIZE)
+#define HEAP_PAGE_COUNT (HEAP_SIZE / PAGE_SIZE)  /* 4096 pages */
+
+/* =========================================================================
  * Physical <-> Kernel-Virtual Address Conversion
  *
- * Currently an identity map (1:1).  When the kernel migrates to a
- * higher-half layout, only the implementation in page_table.c changes.
+ * The kernel is linked at a higher-half virtual address.  All physical
+ * addresses passed to C code must be converted to kernel-virtual before
+ * dereferencing.  pt_phys_to_virt / pt_virt_to_phys handle this.
  * ========================================================================= */
+
+/** Offset between physical addresses and kernel-virtual addresses.
+ *  Kernel VMA = physical + HIGHER_HALF_OFFSET.
+ *  Matches the KERNEL_OFFSET in linker.ld. */
+#define HIGHER_HALF_OFFSET 0xFFFFFFFF80000000ULL
 
 /**
  * @brief Convert a physical address to a kernel-virtual pointer.
  *
- * In the identity-mapped layout, this is a direct cast.  After a
- * higher-half migration, this adds the offset constant.
+ * Adds HIGHER_HALF_OFFSET so the result can be dereferenced in the
+ * kernel's higher-half address space.
  */
 void *pt_phys_to_virt(uint64_t phys);
 
 /**
  * @brief Convert a kernel-virtual pointer to a physical address.
  *
- * In the identity-mapped layout, this is a direct cast.  After a
- * higher-half migration, this subtracts the offset constant.
+ * Subtracts HIGHER_HALF_OFFSET to recover the original physical address.
  */
 uint64_t pt_virt_to_phys(void *virt);
 

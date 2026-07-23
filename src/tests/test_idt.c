@@ -171,9 +171,9 @@ static void test_idt_doublefault_ist1(serial_dev_t *dev) {
  * PIC tests (4 tests)
  * ========================================================================= */
 
-/** Test 6: Master PIC IMR == 0xFF (all IRQs masked) after init. */
+/** Test 6: Master PIC IMR — all IRQs masked except IRQ0 (timer_init unmasks IRQ0). */
 static void test_pic_imr_master_masked(serial_dev_t *dev) {
-    ASSERT_EQ(dev, (uint32_t)pic_get_imr_master(), (uint32_t)0xFF);
+    ASSERT_EQ(dev, (uint32_t)pic_get_imr_master(), (uint32_t)0xFE);
 }
 
 /** Test 7: Slave PIC IMR == 0xFF (all IRQs masked) after init. */

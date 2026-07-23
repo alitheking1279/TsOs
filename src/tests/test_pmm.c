@@ -53,6 +53,7 @@
 
 #include "test.h"
 #include "../kernel/pmm.h"
+#include "../kernel/page_table.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -131,8 +132,8 @@ static void test_pmm_frame0_reserved(serial_dev_t *dev) {
 
 /** A3: Every frame in the kernel image is marked USED. */
 static void test_pmm_kernel_reserved(serial_dev_t *dev) {
-    uint64_t ks = (uint64_t)(uintptr_t)_kernel_start;
-    uint64_t ke = (uint64_t)(uintptr_t)_kernel_end;
+    uint64_t ks = (uint64_t)(uintptr_t)_kernel_start - HIGHER_HALF_OFFSET;
+    uint64_t ke = (uint64_t)(uintptr_t)_kernel_end   - HIGHER_HALF_OFFSET;
 
     serial_write_string(dev, "[PMM TEST] kernel_reserved:\r\n");
     t_log_hex(dev, "kernel_start", ks);
@@ -594,13 +595,15 @@ static void test_pmm_mark_free_frame0_noop(serial_dev_t *dev) {
  * and the bitmap that sits in .bss.
  */
 static void test_pmm_bitmap_reserved(serial_dev_t *dev) {
-    uint64_t ks = (uint64_t)(uintptr_t)_kernel_start;
-    uint64_t ke = (uint64_t)(uintptr_t)_kernel_end;
+    uint64_t ks = (uint64_t)(uintptr_t)_kernel_start - HIGHER_HALF_OFFSET;
+    uint64_t ke = (uint64_t)(uintptr_t)_kernel_end   - HIGHER_HALF_OFFSET;
 
     /* Sample at least 8 evenly-spaced page-aligned addresses. */
     uint64_t span  = ke - ks;
     uint64_t step  = (span / 8) & ~(uint64_t)(PAGE_SIZE - 1);
     if (step == 0) step = PAGE_SIZE;
+
+    uint64_t start_addr = (ks + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
 
     serial_write_string(dev, "[PMM TEST] bitmap_reserved:\r\n");
     t_log_hex(dev, "kernel_start", ks);
@@ -608,7 +611,7 @@ static void test_pmm_bitmap_reserved(serial_dev_t *dev) {
     t_log_hex(dev, "sample_step ", step);
 
     int all_used = 1;
-    for (uint64_t addr = ks; addr < ke; addr += step) {
+    for (uint64_t addr = start_addr; addr < ke; addr += step) {
         int f = pmm_is_free(addr);
         if (f != 0) {
             serial_write_string(dev, "[PMM TEST]   FAIL: addr ");
@@ -647,6 +650,89 @@ static void test_pmm_alloc_never_frame0(serial_dev_t *dev) {
     pmm_free_frame(addr);
 
     pmm_get_stats(&after);
+    ASSERT_EQ(dev, after.free_frames, before.free_frames);
+}
+
+/* =========================================================================
+ * Group G — Edge cases for count=0, out-of-range, large contig, symmetry
+ * ========================================================================= */
+
+/** G1: pmm_alloc_frames(0) returns 0 (no-op). */
+static void test_pmm_alloc_frames_zero(serial_dev_t *dev) {
+    uint64_t addr = pmm_alloc_frames(0);
+    serial_write_string(dev, "[PMM TEST] alloc_frames_zero: addr=");
+    t_hex64(dev, addr); serial_write_string(dev, "\r\n");
+    ASSERT_EQ(dev, addr, (uint64_t)0);
+}
+
+/** G2: pmm_free_frame on an out-of-range address returns PMM_ERR_INVALID. */
+static void test_pmm_free_frame_out_of_range(serial_dev_t *dev) {
+    /* Pick an address far beyond any real RAM. */
+    uint64_t bad = 0x80000000ULL;  /* 2 GiB — beyond QEMU's 128 MiB default */
+    pmm_status_t st = pmm_free_frame(bad);
+    serial_write_string(dev, "[PMM TEST] free_frame_out_of_range: status=");
+    t_uint64(dev, (uint64_t)(-(int)st));
+    serial_write_string(dev, "\r\n");
+    ASSERT_EQ(dev, (int)st, (int)PMM_ERR_INVALID);
+}
+
+/** G3: pmm_is_free on an out-of-range address returns -1. */
+static void test_pmm_is_free_out_of_range(serial_dev_t *dev) {
+    uint64_t bad = 0x80000000ULL;
+    int r = pmm_is_free(bad);
+    serial_write_string(dev, "[PMM TEST] is_free_out_of_range: ");
+    t_uint64(dev, (uint64_t)(r < 0 ? (uint64_t)(-r) : (uint64_t)r));
+    serial_write_string(dev, "\r\n");
+    ASSERT_EQ(dev, r, -1);
+}
+
+/** G4: pmm_alloc_frames(16) returns aligned, contiguous, and frees cleanly. */
+static void test_pmm_alloc_contig_large(serial_dev_t *dev) {
+    pmm_stats_t before, after;
+    pmm_get_stats(&before);
+
+    uint64_t base = pmm_alloc_frames(16);
+    serial_write_string(dev, "[PMM TEST] alloc_contig_large: base=");
+    t_hex64(dev, base); serial_write_string(dev, "\r\n");
+    ASSERT_TRUE(dev, base != 0);
+    ASSERT_EQ(dev, base & 0xFFF, 0ULL);
+
+    /* Every frame in the 16-page block must be USED. */
+    for (uint64_t i = 0; i < 16; i++) {
+        ASSERT_EQ(dev, pmm_is_free(base + i * PAGE_SIZE), 0);
+    }
+
+    pmm_get_stats(&after);
+    ASSERT_EQ(dev, before.free_frames - after.free_frames, (uint64_t)16);
+
+    /* Free all and verify symmetry. */
+    for (uint64_t i = 0; i < 16; i++)
+        pmm_free_frame(base + i * PAGE_SIZE);
+
+    pmm_get_stats(&after);
+    ASSERT_EQ(dev, after.free_frames, before.free_frames);
+}
+
+/** G5: Alloc N frames, free N frames — free_frames is unchanged. */
+#define SYMMETRY_N 32
+static void test_pmm_stats_symmetric(serial_dev_t *dev) {
+    pmm_stats_t before, after;
+    pmm_get_stats(&before);
+
+    uint64_t frames[SYMMETRY_N];
+    for (int i = 0; i < SYMMETRY_N; i++) {
+        frames[i] = pmm_alloc_frame();
+        ASSERT_TRUE(dev, frames[i] != 0);
+    }
+
+    for (int i = 0; i < SYMMETRY_N; i++)
+        pmm_free_frame(frames[i]);
+
+    pmm_get_stats(&after);
+    serial_write_string(dev, "[PMM TEST] stats_symmetric: before=");
+    t_uint64(dev, before.free_frames);
+    serial_write_string(dev, " after="); t_uint64(dev, after.free_frames);
+    serial_write_string(dev, "\r\n");
     ASSERT_EQ(dev, after.free_frames, before.free_frames);
 }
 
@@ -693,4 +779,11 @@ void test_register_pmm(void) {
     test_register("pmm_mark_free_frame0_noop",  test_pmm_mark_free_frame0_noop);
     test_register("pmm_bitmap_reserved",        test_pmm_bitmap_reserved);
     test_register("pmm_alloc_never_frame0",     test_pmm_alloc_never_frame0);
+
+    /* Group G — Edge cases */
+    test_register("pmm_alloc_frames_zero",      test_pmm_alloc_frames_zero);
+    test_register("pmm_free_frame_out_of_range", test_pmm_free_frame_out_of_range);
+    test_register("pmm_is_free_out_of_range",   test_pmm_is_free_out_of_range);
+    test_register("pmm_alloc_contig_large",     test_pmm_alloc_contig_large);
+    test_register("pmm_stats_symmetric",        test_pmm_stats_symmetric);
 }

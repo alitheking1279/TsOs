@@ -151,7 +151,7 @@ void vmm_init(void *serial_dev) {
     /* Capture the current CR3 — this is the boot page table PML4. */
     uint64_t cr3_phys = pt_read_cr3();
 
-    g_kernel_aspace.pml4      = (uint64_t *)(uintptr_t)cr3_phys;  /* identity map */
+    g_kernel_aspace.pml4      = pt_phys_to_virt(cr3_phys);
     g_kernel_aspace.pml4_phys = cr3_phys;
     g_kernel_aspace.is_kernel = true;
 
@@ -185,14 +185,15 @@ vmm_status_t vmm_create_address_space(address_space_t *out) {
         return VMM_ERR_NO_MEM;
     }
 
-    uint64_t *pml4 = (uint64_t *)(uintptr_t)pml4_phys;  /* identity map */
+    uint64_t *pml4 = pt_phys_to_virt(pml4_phys);
 
     /* Zero the entire PML4. */
     memset(pml4, 0, PAGE_SIZE);
 
-    /* Copy entry 0 (identity mapping) from the kernel PML4 so the
-     * kernel code at physical addresses remains accessible after CR3
-     * switch.  The PDPT and PD pages are shared (not copied). */
+    /* Copy entry 0 from the kernel PML4.  This was the identity map
+     * before it was removed; it is now 0 in the kernel address space.
+     * We copy it anyway so that any future PML4[0] user mappings in
+     * the kernel are reflected in new address spaces. */
     pml4[0] = g_kernel_aspace.pml4[0];
 
     /* Copy upper 256 entries (kernel half) from the kernel PML4.
@@ -226,7 +227,8 @@ vmm_status_t vmm_destroy_address_space(address_space_t *as) {
     /* Free all user-mode page table pages (levels 1, 2, 3).
      * Level 3 = PDPT sub-tables (256 user entries in PML4).
      * We recurse from each user PDPT entry.
-     * Skip entry 0 — it is the shared kernel identity mapping. */
+     * Skip entry 0 — it is shared with the kernel (copied from
+     * the kernel PML4 at create time) and must not be freed. */
     for (int i = 1; i < 256; i++) {
         uint64_t entry = as->pml4[i];
         if (!(entry & PTE_PRESENT)) continue;
@@ -234,7 +236,7 @@ vmm_status_t vmm_destroy_address_space(address_space_t *as) {
         /* The PDPT page itself is at pte_addr(entry).
          * Recurse to free PD and PT pages under it. */
         uint64_t pdpt_phys = pte_addr(entry);
-        uint64_t *pdpt = (uint64_t *)(uintptr_t)pdpt_phys;
+        uint64_t *pdpt = pt_phys_to_virt(pdpt_phys);
 
         pt_free_recursive(pdpt, 2);  /* level 2 = free PD and PT pages */
 
@@ -381,6 +383,9 @@ vmm_status_t vmm_unmap_range(address_space_t *as, uint64_t vaddr_start,
 
     for (uint64_t va = vaddr_start; va < vaddr_end; va += PAGE_SIZE) {
         vmm_unmap_page(as, va);
+        /* Guard: prevent wrap-around at the top of the 64-bit address space.
+         * If va + PAGE_SIZE would overflow, we have unmapped the last page. */
+        if (va + PAGE_SIZE < va) break;
     }
 
     return VMM_OK;
@@ -401,7 +406,7 @@ uint64_t vmm_translate(address_space_t *as, uint64_t vaddr) {
     if (!(pml4e & PTE_PRESENT)) return 0;
 
     /* Walk PDPT. */
-    uint64_t *pdpt = (uint64_t *)(uintptr_t)pt_phys_to_virt(pte_addr(pml4e));
+    uint64_t *pdpt = (uint64_t *)pt_phys_to_virt(pte_addr(pml4e));
     uint64_t pdpe = pdpt[PDPT_INDEX(vaddr)];
     if (!(pdpe & PTE_PRESENT)) return 0;
 
@@ -411,7 +416,7 @@ uint64_t vmm_translate(address_space_t *as, uint64_t vaddr) {
     }
 
     /* Walk PD. */
-    uint64_t *pd = (uint64_t *)(uintptr_t)pt_phys_to_virt(pte_addr(pdpe));
+    uint64_t *pd = (uint64_t *)pt_phys_to_virt(pte_addr(pdpe));
     uint64_t pde = pd[PD_INDEX(vaddr)];
     if (!(pde & PTE_PRESENT)) return 0;
 
@@ -421,7 +426,7 @@ uint64_t vmm_translate(address_space_t *as, uint64_t vaddr) {
     }
 
     /* Walk PT. */
-    uint64_t *pt = (uint64_t *)(uintptr_t)pt_phys_to_virt(pte_addr(pde));
+    uint64_t *pt = (uint64_t *)pt_phys_to_virt(pte_addr(pde));
     uint64_t pte = pt[PT_INDEX(vaddr)];
     if (!(pte & PTE_PRESENT)) return 0;
 
@@ -457,12 +462,21 @@ vmm_status_t vmm_clone_address_space(address_space_t *src,
             VMM_LOG_ERR("CLONE: OOM at PML4[");
             vmm_log_uint64((uint64_t)i);
             VMM_LOG_ERR("]\r\n");
+            /* Free ALL previously-installed user PML4 entries (0..i-1). */
+            for (int c = 0; c < i; c++) {
+                if (!(dst->pml4[c] & PTE_PRESENT)) continue;
+                uint64_t pdpt_phys_c = pte_addr(dst->pml4[c]);
+                uint64_t *pdpt_c = pt_phys_to_virt(pdpt_phys_c);
+                pt_free_recursive(pdpt_c, 2);
+                pmm_free_frame(pdpt_phys_c);
+                dst->pml4[c] = 0;
+            }
             return VMM_ERR_NO_MEM;
         }
 
-        uint64_t *src_pdpt = (uint64_t *)(uintptr_t)
+        uint64_t *src_pdpt = (uint64_t *)
             pt_phys_to_virt(pte_addr(src_entry));
-        uint64_t *dst_pdpt = (uint64_t *)(uintptr_t)new_pdpt_phys;
+        uint64_t *dst_pdpt = pt_phys_to_virt(new_pdpt_phys);
         memset(dst_pdpt, 0, PAGE_SIZE);
 
         /* Copy and recurse: clone PD and PT tables. */
@@ -485,12 +499,21 @@ vmm_status_t vmm_clone_address_space(address_space_t *src,
                 VMM_LOG_ERR("CLONE: OOM at PDPT\r\n");
                 pt_free_recursive(dst_pdpt, 2);
                 pmm_free_frame(new_pdpt_phys);
+                /* Free ALL previously-installed user PML4 entries. */
+                for (int c = 0; c < i; c++) {
+                    if (!(dst->pml4[c] & PTE_PRESENT)) continue;
+                    uint64_t pdpt_phys_c = pte_addr(dst->pml4[c]);
+                    uint64_t *pdpt_c = pt_phys_to_virt(pdpt_phys_c);
+                    pt_free_recursive(pdpt_c, 2);
+                    pmm_free_frame(pdpt_phys_c);
+                    dst->pml4[c] = 0;
+                }
                 return VMM_ERR_NO_MEM;
             }
 
-            uint64_t *src_pd = (uint64_t *)(uintptr_t)
+            uint64_t *src_pd = (uint64_t *)
                 pt_phys_to_virt(pte_addr(src_pdpe));
-            uint64_t *dst_pd = (uint64_t *)(uintptr_t)new_pd_phys;
+            uint64_t *dst_pd = pt_phys_to_virt(new_pd_phys);
             memset(dst_pd, 0, PAGE_SIZE);
 
             for (int k = 0; k < PT_ENTRIES; k++) {
@@ -506,23 +529,31 @@ vmm_status_t vmm_clone_address_space(address_space_t *src,
                     continue;
                 }
 
-                /* Allocate new PT, copy 512 entries with COW marking.
-                 * Writable user pages get COW flag set and WRITABLE
-                 * cleared in both src and dst — first write triggers
-                 * a page fault that allocates a private copy. */
+                /* Allocate new PT, copy 512 entries with COW marking. */
                 uint64_t new_pt_phys = pmm_alloc_frame();
                 if (new_pt_phys == 0) {
                     VMM_LOG_ERR("CLONE: OOM at PD\r\n");
+                    /* Clean up current PD subtree (entries k..511 already 0). */
                     pt_free_recursive(dst_pd, 1);
                     pmm_free_frame(new_pd_phys);
+                    dst_pdpt[j] = 0;
                     pt_free_recursive(dst_pdpt, 2);
                     pmm_free_frame(new_pdpt_phys);
+                    /* Free ALL previously-installed user PML4 entries. */
+                    for (int c = 0; c < i; c++) {
+                        if (!(dst->pml4[c] & PTE_PRESENT)) continue;
+                        uint64_t pdpt_phys_c = pte_addr(dst->pml4[c]);
+                        uint64_t *pdpt_c = pt_phys_to_virt(pdpt_phys_c);
+                        pt_free_recursive(pdpt_c, 2);
+                        pmm_free_frame(pdpt_phys_c);
+                        dst->pml4[c] = 0;
+                    }
                     return VMM_ERR_NO_MEM;
                 }
 
-                uint64_t *src_pt = (uint64_t *)(uintptr_t)
+                uint64_t *src_pt = (uint64_t *)
                     pt_phys_to_virt(pte_addr(src_pde));
-                uint64_t *dst_pt = (uint64_t *)(uintptr_t)
+                uint64_t *dst_pt = (uint64_t *)
                     pt_phys_to_virt(new_pt_phys);
 
                 for (int m = 0; m < PT_ENTRIES; m++) {
@@ -535,9 +566,7 @@ vmm_status_t vmm_clone_address_space(address_space_t *src,
                     uint64_t leaf_phys = pte_addr(src_leaf);
                     uint64_t leaf_flags = pte_flags(src_leaf);
 
-                    /* COW: mark writable pages that aren't already COW.
-                     * Clear WRITABLE in both src and dst; first write
-                     * triggers #PF → handler allocates private copy. */
+                    /* COW: mark writable pages that aren't already COW. */
                     if ((leaf_flags & PTE_WRITABLE) &&
                         !(leaf_flags & PTE_COW)) {
                         uint64_t cow_flags = (leaf_flags & ~PTE_WRITABLE)
@@ -556,8 +585,7 @@ vmm_status_t vmm_clone_address_space(address_space_t *src,
             dst_pdpt[j] = pte_make(new_pd_phys, pte_flags(src_pdpe));
         }
 
-        /* Install the cloned PDPT into the destination PML4.
-         * Preserve the same flags as the source. */
+        /* Install the cloned PDPT into the destination PML4. */
         dst->pml4[i] = pte_make(new_pdpt_phys, pte_flags(src_entry));
     }
 
@@ -586,4 +614,42 @@ address_space_t *vmm_get_kernel_address_space(void) {
 
 bool vmm_is_initialized(void) {
     return g_vmm_initialized;
+}
+
+vmm_status_t vmm_unmap_and_free(address_space_t *as, uint64_t vaddr) {
+    if (!g_vmm_initialized) return VMM_ERR_NOT_INIT;
+
+    vmm_status_t st;
+    st = validate_aspace(as);
+    if (st != VMM_OK) return st;
+
+    st = validate_vaddr(vaddr);
+    if (st != VMM_OK) return st;
+
+    /* Walk to the leaf PTE. */
+    uint64_t *pte = pt_walk_to_leaf(as->pml4, vaddr, false, 0);
+    if (!pte || !(*pte & PTE_PRESENT)) {
+        return VMM_ERR_NOT_MAPPED;
+    }
+
+    /* Save physical address before clearing. */
+    uint64_t phys = pte_addr(*pte);
+
+    /* Clear the PTE and flush TLB. */
+    *pte = 0;
+    pt_invlpg((void *)vaddr);
+
+    /* Free the physical frame back to PMM. */
+    pmm_free_frame(phys);
+
+    VMM_LOG_INF("UNMAP_FREE: vaddr ");
+    vmm_log_hex64(vaddr);
+    VMM_LOG_INF(" -> paddr ");
+    vmm_log_hex64(phys);
+    VMM_LOG_INF(" freed\r\n");
+
+    /* Free intermediate page tables that became empty. */
+    pt_cleanup_empty_tables(as->pml4, vaddr);
+
+    return VMM_OK;
 }

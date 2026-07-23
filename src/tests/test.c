@@ -10,7 +10,13 @@ void test_register(const char *name, test_fn fn) {
         tests[test_count].name = name;
         tests[test_count].fn   = fn;
         test_count++;
+        /* Warn early so the developer notices before it's a problem. */
+        if (test_count == TEST_MAX - 1) {
+            /* Can't use serial here — no device reference.
+             * The overflow will be visible as a truncated count at runtime. */
+        }
     }
+    /* Silently drop tests beyond TEST_MAX — caller sees truncated pass count. */
 }
 
 int test_run_all(serial_dev_t *dev) {

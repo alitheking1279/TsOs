@@ -1,28 +1,39 @@
 ; =============================================================================
-; boot.asm - Multiboot2 32-bit -> 64-bit long mode bootstrap
+; boot.asm - Multiboot2 32-bit -> 64-bit long mode bootstrap (higher-half)
 ;
 ; Boot flow:
 ;   1. Verify we were actually loaded by a Multiboot2-compliant loader.
 ;   2. Verify the CPU supports CPUID, long mode, and PAE before using them.
-;   3. Build minimal 4-level page tables identity-mapping the first 1 GiB.
+;   3. Build minimal 4-level page tables:
+;        - Identity map first 1 GiB via PML4[0]   (for 32-bit code)
+;        - Higher-half map    via PML4[511]        (for kernel at 0xFFFFFFFF80000000+)
 ;   4. Enable PAE, set the Long Mode Enable bit, enable paging (activates
 ;      compatibility mode), then load a 64-bit GDT and far-jump into
 ;      genuine 64-bit long mode.
-;   5. Hand control to kernel_main, passing the Multiboot magic and info
-;      pointer as its first two arguments (System V AMD64 ABI: rdi, rsi).
+;   5. In 64-bit mode, switch to the higher-half kernel stack and call
+;      kernel_main with the Multiboot magic and info pointer.
+;
+; Section layout:
+;   .boot.text / .boot.data  — linked at physical 1M (for32-bit addressing)
+;   .text (higher-half)      — long_mode_entry lives here (but is reached
+;                              via far jump from physical code)
+;   .bootstrap_stack         — kernel stack at higher-half VMA
 ;
 ; Any failed sanity check halts the machine after printing a single
 ; character error code directly to VGA text memory (0xB8000), since no
-; kernel drivers exist yet at this stage. This is the standard bare-metal
-; convention (see OSDev Bare Bones / "Rust OS" bootstrap tutorials).
+; kernel drivers exist yet at this stage.
 ; =============================================================================
 
 bits 32
 
+; =============================================================================
+; .boot.text — 32-bit code that runs at physical addresses
+; =============================================================================
+section .boot.text
+
 ; -----------------------------------------------------------------------------
-; Multiboot2 header (unchanged from original - verified spec-compliant)
+; Multiboot2 header (must be in first 32 KiB of loaded image)
 ; -----------------------------------------------------------------------------
-section .multiboot
 align 8
 multiboot_start:
     dd 0xe85250d6                                              ; magic
@@ -36,15 +47,6 @@ multiboot_start:
 multiboot_end:
 
 ; -----------------------------------------------------------------------------
-; Boot stack (16-byte aligned, required by SysV ABI at kernel_main entry)
-; -----------------------------------------------------------------------------
-section .bootstrap_stack, nobits
-align 16
-stack_bottom:
-    resb 16384
-stack_top:
-
-; -----------------------------------------------------------------------------
 ; Constants
 ; -----------------------------------------------------------------------------
 PAGE_PRESENT  equ 1 << 0
@@ -54,22 +56,21 @@ PAGE_HUGE     equ 1 << 7   ; 2 MiB page (valid at the PD level)
 MULTIBOOT2_MAGIC equ 0x36d76289   ; value the loader leaves in EAX
 
 ; -----------------------------------------------------------------------------
-section .text
+; Entry point — linked at physical 1M
+; -----------------------------------------------------------------------------
 global _start
 extern kernel_main
 
 _start:
-    ; Set up the stack first - everything below uses `call`/`ret`.
-    mov esp, stack_top
+    ; Use the boot stack in .boot.data (physical address, always accessible).
+    mov esp, boot_stack_top
     mov ebp, esp
 
     ; EBX holds the physical address of the Multiboot2 info structure.
-    ; Save it immediately: CPUID (used below) clobbers EBX, so if we
-    ; don't stash this now it is lost forever.
-    mov [multiboot_info_ptr], ebx
+    ; Save it immediately: CPUID (used below) clobbers EBX.
+    mov [mb2_info_save], ebx
 
-    ; EAX holds the Multiboot2 magic value. Check it before EAX is
-    ; reused by anything else.
+    ; EAX holds the Multiboot2 magic value.
     cmp eax, MULTIBOOT2_MAGIC
     jne .err_no_multiboot
 
@@ -78,7 +79,12 @@ _start:
     call set_up_page_tables
     call enable_paging
 
+    ; Paging is now on — identity map still active so physical addresses work.
+    ; Load the 64-bit GDT (at physical address in .boot.data).
     lgdt [gdt64.pointer]
+
+    ; Far jump into 64-bit long mode — target is in this same section
+    ; (physical address, identity-mapped).
     jmp gdt64.code:long_mode_entry
 
 .err_no_multiboot:
@@ -88,24 +94,23 @@ _start:
 ; -----------------------------------------------------------------------------
 ; check_cpuid
 ; Confirms CPUID is available by attempting to flip EFLAGS bit 21 (ID).
-; If the CPU allows the bit to be flipped, CPUID is supported.
 ; -----------------------------------------------------------------------------
 check_cpuid:
     pushfd
     pop eax
-    mov ecx, eax        ; keep original flags in ECX for comparison
-    xor eax, 1 << 21     ; try to flip the ID bit
+    mov ecx, eax
+    xor eax, 1 << 21
     push eax
     popfd
 
     pushfd
-    pop eax              ; read back what actually stuck
+    pop eax
 
     push ecx
-    popfd                ; restore original flags
+    popfd
 
     cmp eax, ecx
-    je .no_cpuid         ; bit didn't change -> no CPUID support
+    je .no_cpuid
     ret
 .no_cpuid:
     mov al, '1'
@@ -113,24 +118,19 @@ check_cpuid:
 
 ; -----------------------------------------------------------------------------
 ; check_long_mode
-; Confirms the extended CPUID leaf for long-mode detection exists, then
-; confirms long mode itself is supported. Also requires PAE support,
-; since we rely on PAE-style page tables below.
+; Confirms long mode and PAE are supported.
 ; -----------------------------------------------------------------------------
 check_long_mode:
-    ; Extended functions (>= 0x80000001) must be available first.
     mov eax, 0x80000000
     cpuid
     cmp eax, 0x80000001
     jb .no_long_mode
 
-    ; Bit 29 of EDX from leaf 0x80000001 = Long Mode available.
     mov eax, 0x80000001
     cpuid
     test edx, 1 << 29
     jz .no_long_mode
 
-    ; Confirm PAE is present too (required for the page table format used).
     mov eax, 1
     cpuid
     test edx, 1 << 6
@@ -143,23 +143,46 @@ check_long_mode:
 
 ; -----------------------------------------------------------------------------
 ; set_up_page_tables
-; Builds a minimal PML4 -> PDPT -> PD hierarchy identity-mapping the
-; first 1 GiB of physical memory using 2 MiB huge pages. 1 GiB gives the
-; early kernel comfortable headroom without needing a 4th page-table
-; level; extend later once a real physical memory manager exists.
+;
+; Builds two mappings:
+;   1. Identity: PML4[0] -> p3_table -> p2_table -> 512*2MiB = first 1 GiB
+;   2. Higher-half: PML4[511] -> p3_table_hh[510] -> p2_table_hh -> same 1 GiB
+;      mapped at virtual 0xFFFFFFFF80000000..0xFFFFFFFFC0000000
+;
+; VA decomposition for 0xFFFFFFFF80000000:
+;   PML4 index  = 511  (bits 47:39)
+;   PDPT index  = 510  (bits 38:30)
+;   PD   index  =   0  (bits 29:21)
+;   PT   index  =   0  (bits 20:12)
 ; -----------------------------------------------------------------------------
 set_up_page_tables:
-    ; PML4[0] -> PDPT
+    ; === PML4 entries ===
+
+    ; PML4[0] -> identity PDPT
     mov eax, p3_table
     or eax, PAGE_PRESENT | PAGE_WRITABLE
     mov [p4_table], eax
 
-    ; PDPT[0] -> PD
+    ; PML4[511] -> higher-half PDPT
+    mov eax, p3_table_hh
+    or eax, PAGE_PRESENT | PAGE_WRITABLE
+    mov [p4_table + 511*8], eax
+
+    ; === Identity PDPT ===
+
+    ; PDPT[0] -> identity PD (first 1 GiB)
     mov eax, p2_table
     or eax, PAGE_PRESENT | PAGE_WRITABLE
     mov [p3_table], eax
 
-    ; PD[0..511] -> 512 * 2 MiB huge pages = 1 GiB identity map
+    ; === Higher-half PDPT ===
+
+    ; PDPT[510] -> higher-half PD (maps 0xFFFFFFFF80000000..C0000000)
+    mov eax, p2_table_hh
+    or eax, PAGE_PRESENT | PAGE_WRITABLE
+    mov [p3_table_hh + 510*8], eax
+
+    ; === Identity PD: 512 * 2 MiB huge pages for physical 0..1 GiB ===
     xor ecx, ecx
 .map_p2_loop:
     mov eax, ecx
@@ -171,13 +194,24 @@ set_up_page_tables:
     cmp ecx, 512
     jne .map_p2_loop
 
+    ; === Higher-half PD: same physical 0..1 GiB at VA 0xFFFFFFFF80000000+ ===
+    xor ecx, ecx
+.map_p2_hh_loop:
+    mov eax, ecx
+    shl eax, 21
+    or eax, PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE
+    mov [p2_table_hh + ecx * 8], eax
+
+    inc ecx
+    cmp ecx, 512
+    jne .map_p2_hh_loop
+
     ret
 
 ; -----------------------------------------------------------------------------
 ; enable_paging
-; Points CR3 at the PML4, turns on PAE, sets the Long Mode Enable bit in
-; EFER, then finally enables paging in CR0 (this is what actually
-; activates IA-32e compatibility submode).
+; Points CR3 at the PML4, turns on PAE, sets EFER.LME + EFER.NXE,
+; then enables CR0.PG and CR0.WP.
 ; -----------------------------------------------------------------------------
 enable_paging:
     mov eax, p4_table
@@ -185,6 +219,8 @@ enable_paging:
 
     mov eax, cr4
     or eax, 1 << 5              ; CR4.PAE
+    or eax, 1 << 9              ; CR4.OSFXSR — enable FXSAVE/FXRSTOR
+    or eax, 1 << 7              ; CR4.PGE — enable global pages
     mov cr4, eax
 
     mov ecx, 0xC0000080         ; IA32_EFER MSR
@@ -200,12 +236,10 @@ enable_paging:
 
 ; -----------------------------------------------------------------------------
 ; error
-; Prints "ERR: <code>" in white-on-red to the top-left of VGA text mode
-; (physical 0xB8000, the standard 80x25 text buffer) then halts forever.
-; AL must hold the single-character error code on entry.
+; Prints "ERR: <code>" in white-on-red to VGA text memory then halts.
 ; -----------------------------------------------------------------------------
 error:
-    mov dword [0xb8000], 0x4f524f45   ; "ER" white-on-red
+    mov dword [0xb8000], 0x4f524f45   ; "ER"
     mov dword [0xb8004], 0x4f3a4f52   ; "R:"
     mov dword [0xb8008], 0x4f204f20   ; "  "
     mov byte  [0xb800a], al
@@ -215,35 +249,11 @@ error:
     hlt
     jmp .halt
 
-; -----------------------------------------------------------------------------
-; 64-bit entry point
-; -----------------------------------------------------------------------------
-bits 64
-long_mode_entry:
-    ; Long mode uses flat, effectively-unused data segments; null them out.
-    mov ax, 0
-    mov ss, ax
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
+; =============================================================================
+; .boot.data — page tables, GDT, saved state (all at physical addresses)
+; =============================================================================
+section .boot.data
 
-    ; Pass the Multiboot2 magic and info-structure pointer to the kernel,
-    ; matching the SysV AMD64 ABI (1st arg = rdi, 2nd arg = rsi).
-    mov edi, MULTIBOOT2_MAGIC
-    mov esi, [multiboot_info_ptr]
-
-    call kernel_main
-
-.halt:
-    cli
-    hlt
-    jmp .halt
-
-; -----------------------------------------------------------------------------
-; Data: page tables, GDT, saved boot state
-; -----------------------------------------------------------------------------
-section .data
 align 4096
 p4_table:
     times 512 dq 0
@@ -251,9 +261,13 @@ p3_table:
     times 512 dq 0
 p2_table:
     times 512 dq 0
+p3_table_hh:
+    times 512 dq 0
+p2_table_hh:
+    times 512 dq 0
 
 align 8
-multiboot_info_ptr: dd 0   ; physical address of the Multiboot2 info struct
+mb2_info_save: dd 0
 
 align 8
 gdt64:
@@ -263,3 +277,55 @@ gdt64:
 .pointer:
     dw $ - gdt64 - 1
     dq gdt64
+
+; Boot stack — used only during 32-bit init, small to save space.
+align 16
+boot_stack_bottom:
+    resb 4096
+boot_stack_top:
+
+; =============================================================================
+; 64-bit entry point — still in .boot.text (physical address, identity-mapped)
+;
+; After the far jump from 32-bit mode we are in genuine 64-bit long mode.
+; Both identity and higher-half page table entries are active, so we can
+; access any physical address AND the higher-half kernel addresses.
+; =============================================================================
+section .boot.text
+bits 64
+
+long_mode_entry:
+    ; Clear segment registers (flat model).
+    mov ax, 0
+    mov ss, ax
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    ; Switch to the higher-half kernel stack.
+    mov rsp, stack_top
+    mov rbp, rsp
+
+    ; Pass Multiboot2 magic and info pointer to kernel_main.
+    ; rdi = magic (1st arg, SysV ABI), rsi = info_ptr (2nd arg).
+    mov edi, MULTIBOOT2_MAGIC
+    mov esi, [mb2_info_save]
+
+    call kernel_main
+
+.halt:
+    cli
+    hlt
+    jmp .halt
+
+; =============================================================================
+; Higher-half kernel stack — in the kernel's .bootstrap_stack section,
+; linked at the higher-half VMA (0xFFFFFFFF80...).  Accessible once the
+; higher-half page tables are active.
+; =============================================================================
+section .bootstrap_stack, nobits
+align 16
+stack_bottom:
+    resb 16384
+stack_top:

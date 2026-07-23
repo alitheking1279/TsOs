@@ -1,4 +1,5 @@
 #include "test.h"
+#include "../kernel/page_table.h"
 #include <stdint.h>
 
 /* Globals set by kernel_main before tests run */
@@ -39,25 +40,27 @@ static void test_cr3_nonzero(serial_dev_t *dev) {
 
 static void test_pml4_present(serial_dev_t *dev) {
     uint64_t cr3 = read_cr3();
-    uint64_t *pml4 = (uint64_t *)(cr3 & ~0xFFFULL);
-    uint64_t entry = pml4[0];
+    uint64_t *pml4 = (uint64_t *)pt_phys_to_virt(cr3 & ~0xFFFULL);
+    /* Identity map (PML4[0]) was removed; higher-half entry (PML4[511]) must be present. */
+    uint64_t entry = pml4[511];
     ASSERT_TRUE(dev, (entry & PAGE_PRESENT) != 0);
     ASSERT_TRUE(dev, (entry & PAGE_WRITABLE) != 0);
 }
 
 static void test_pdpt_present(serial_dev_t *dev) {
     uint64_t cr3 = read_cr3();
-    uint64_t *pml4 = (uint64_t *)(cr3 & ~0xFFFULL);
-    uint64_t *pdpt = (uint64_t *)(pml4[0] & ~0xFFFULL);
-    ASSERT_TRUE(dev, (pdpt[0] & PAGE_PRESENT) != 0);
-    ASSERT_TRUE(dev, (pdpt[0] & PAGE_WRITABLE) != 0);
+    uint64_t *pml4 = (uint64_t *)pt_phys_to_virt(cr3 & ~0xFFFULL);
+    uint64_t *pdpt = (uint64_t *)pt_phys_to_virt(pml4[511] & ~0xFFFULL);
+    /* PDPT[510] maps the kernel's 2MiB range at VA 0xFFFFFFFF80000000. */
+    ASSERT_TRUE(dev, (pdpt[510] & PAGE_PRESENT) != 0);
+    ASSERT_TRUE(dev, (pdpt[510] & PAGE_WRITABLE) != 0);
 }
 
 static void test_pd_huge_present(serial_dev_t *dev) {
     uint64_t cr3 = read_cr3();
-    uint64_t *pml4 = (uint64_t *)(cr3 & ~0xFFFULL);
-    uint64_t *pdpt = (uint64_t *)(pml4[0] & ~0xFFFULL);
-    uint64_t *pd   = (uint64_t *)(pdpt[0] & ~0xFFFULL);
+    uint64_t *pml4 = (uint64_t *)pt_phys_to_virt(cr3 & ~0xFFFULL);
+    uint64_t *pdpt = (uint64_t *)pt_phys_to_virt(pml4[511] & ~0xFFFULL);
+    uint64_t *pd   = (uint64_t *)pt_phys_to_virt(pdpt[510] & ~0xFFFULL);
 
     /* All 512 entries should be present + writable + huge (2MiB pages) */
     for (int i = 0; i < 512; i++) {
@@ -87,9 +90,10 @@ static void test_pd_huge_present(serial_dev_t *dev) {
 }
 
 static void test_identity_map_readwrite(serial_dev_t *dev) {
-    /* Address 2MiB is safely within identity-mapped first 1GiB
-     * and well above the kernel. Use a pattern that isn't zero. */
-    volatile uint32_t *ptr = (volatile uint32_t *)0x200000;
+    /* The identity map was removed after init. Verify we can still read/write
+     * through the higher-half mapping. Use a safe address within the first 1GiB
+     * that's above the kernel image. */
+    volatile uint32_t *ptr = (volatile uint32_t *)0xFFFFFFFF80200000ULL;
     uint32_t old = *ptr;    /* save */
     *ptr = 0xDEADBEEF;
     ASSERT_EQ(dev, *ptr, (uint32_t)0xDEADBEEF);

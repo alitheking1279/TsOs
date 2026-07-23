@@ -3,7 +3,7 @@
  * @brief Low-level x86-64 page table operations — walk, allocate, flush.
  *
  * This file provides the primitives that vmm.c builds on:
- *   - Physical-to-kernel-virtual address translation (identity map for now)
+ *   - Physical-to-kernel-virtual address translation (higher-half offset)
  *   - Page table entry read/write/clear
  *   - Walk from PML4 to a leaf PTE (with optional intermediate allocation)
  *   - TLB flush (single-page INVLPG and full CR3 reload)
@@ -11,8 +11,8 @@
  *
  * Design constraints:
  *   - Every function that touches page table memory uses
- *     pt_phys_to_virt() for address conversion.  When the kernel
- *     migrates to a higher-half layout, only this one function changes.
+ *     pt_phys_to_virt() for address conversion.  The higher-half
+ *     offset is maintained in one place (page_table.h).
  *   - All allocation goes through pmm_alloc_frame().  If the PMM is
  *     out of memory, the caller gets a NULL return, not a panic.
  *   - Serial logging is gated through an extern serial_dev_t pointer
@@ -75,23 +75,17 @@ static void pt_log_uint64(uint64_t val) {
 /* =========================================================================
  * Address Conversion
  *
- * Currently an identity map: physical == kernel-virtual.
- * When the kernel moves to a higher-half layout, change the body of
- * these two functions and every page table operation automatically follows.
+ * Higher-half layout: kernel-virtual = physical + HIGHER_HALF_OFFSET.
+ * Every function that touches page-table memory calls pt_phys_to_virt()
+ * so the mapping is maintained in one place.
  * ========================================================================= */
 
 void *pt_phys_to_virt(uint64_t phys) {
-    /* Identity map: physical address == kernel-virtual address.
-     * After higher-half migration, this becomes:
-     *   return (void *)(phys + HIGHER_HALF_OFFSET); */
-    return (void *)(uintptr_t)phys;
+    return (void *)(phys + HIGHER_HALF_OFFSET);
 }
 
 uint64_t pt_virt_to_phys(void *virt) {
-    /* Identity map: kernel-virtual address == physical address.
-     * After higher-half migration, this becomes:
-     *   return (uint64_t)virt - HIGHER_HALF_OFFSET; */
-    return (uint64_t)(uintptr_t)virt;
+    return (uint64_t)virt - HIGHER_HALF_OFFSET;
 }
 
 /* =========================================================================
@@ -360,8 +354,8 @@ void pt_free_recursive(uint64_t *table, int level) {
  * to locate the intermediate tables for `vaddr`, then walks back up
  * freeing any that are empty and clearing the parent entry.
  *
- * Safety: PML4 entries 0 (kernel identity) and 256-511 (kernel half)
- * are never cleared — only user-space entries (1-255) may be freed.
+     * Safety: PML4 entries 0 and 256-511 (kernel half) are never
+     * cleared — only user-space entries (1-255) may be freed.
  *
  * @param pml4   PML4 table pointer (kernel-virtual).
  * @param vaddr  Virtual address whose intermediate tables to check.
