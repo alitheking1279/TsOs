@@ -1,6 +1,6 @@
 /**
  * @file string.c
- * @brief Freestanding memset/memcpy/memcmp — no libc dependency.
+ * @brief Freestanding string utilities — no libc dependency.
  */
 
 #include <stdint.h>
@@ -28,4 +28,36 @@ int memcmp(const void *s1, const void *s2, size_t n) {
         b++;
     }
     return 0;
+}
+
+size_t strlen(const char *s) {
+    size_t len = 0;
+    while (*s++) len++;
+    return len;
+}
+
+int strcmp(const char *s1, const char *s2) {
+    while (*s1 && *s1 == *s2) {
+        s1++;
+        s2++;
+    }
+    return (unsigned char)*s1 - (unsigned char)*s2;
+}
+
+int strncmp(const char *s1, const char *s2, size_t n) {
+    while (n && *s1 && *s1 == *s2) {
+        s1++;
+        s2++;
+        n--;
+    }
+    if (n == 0) return 0;
+    return (unsigned char)*s1 - (unsigned char)*s2;
+}
+
+char *strchr(const char *s, int c) {
+    while (*s) {
+        if (*s == (char)c) return (char *)s;
+        s++;
+    }
+    return (c == '\0') ? (char *)s : (void *)0;
 }

@@ -47,6 +47,11 @@
 #include "syscall.h"
 #include "elf.h"
 #include "../drivers/serial.h"
+#include "../drivers/ata.h"
+#include "../fs/block_dev.h"
+#include "../fs/bcache.h"
+#include "../fs/vfs.h"
+#include "../fs/ext2.h"
 #include "../lib/print.h"
 #include "../tests/test.h"
 #include <stdint.h>
@@ -82,6 +87,19 @@ extern void test_register_syscall(void);
 extern void test_register_validation(void);
 extern void test_register_usermode(void);
 extern void test_register_elf(void);
+extern void test_register_ata(void);
+extern void test_register_block_dev(void);
+extern void test_register_bcache(void);
+extern void test_register_ext2_struct(void);
+extern void test_register_ext2_inode_ops(void);
+extern void test_register_ext2_bitmap(void);
+extern void test_register_ext2_block_map(void);
+extern void test_register_ext2_fileio(void);
+extern void test_register_ext2_dir(void);
+extern void test_register_ext2_path(void);
+extern void test_register_ext2_syscall(void);
+extern void test_register_ext2_phase9(void);
+extern void test_register_vfs(void);
 
 /* =========================================================================
  * Fault handlers — diagnostic dumps for PMM-critical exceptions
@@ -412,6 +430,29 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     elf_init(&g_serial);
     serial_write_string(&g_serial, "[INFO] ELF loader initialized.\r\n");
 
+    /* --- 14d. ATA PIO driver init. */
+    ata_status_t ata_st = ata_init(&g_serial);
+    if (ata_st == ATA_OK) {
+        serial_write_string(&g_serial, "[INFO] ATA PIO driver initialized.\r\n");
+    } else {
+        serial_write_string(&g_serial, "[WARN] ATA init failed: ");
+        serial_write_string(&g_serial, ata_status_string(ata_st));
+        serial_write_string(&g_serial, " (tests will use mock devices)\r\n");
+    }
+
+    /* --- 14e. Block device layer init. */
+    block_dev_init(&g_serial);
+    serial_write_string(&g_serial, "[INFO] Block device layer initialized.\r\n");
+
+    /* --- 14f. Buffer cache init. */
+    bcache_init(&g_serial);
+    serial_write_string(&g_serial, "[INFO] Buffer cache initialized.\r\n");
+
+    /* --- 14g. VFS init. */
+    vfs_init();
+    vfs_register_fs(&ext2_vfs_ops);
+    serial_write_string(&g_serial, "[INFO] VFS initialized, ext2 registered.\r\n");
+
     /* --- 15. Tests --- */
     test_register_serial();
     test_register_boot();
@@ -435,6 +476,19 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     test_register_validation();
     test_register_usermode();
     test_register_elf();
+    test_register_ata();
+    test_register_block_dev();
+    test_register_bcache();
+    test_register_ext2_struct();
+    test_register_ext2_inode_ops();
+    test_register_ext2_bitmap();
+    test_register_ext2_block_map();
+    test_register_ext2_fileio();
+    test_register_ext2_dir();
+    test_register_ext2_path();
+    test_register_ext2_syscall();
+    test_register_ext2_phase9();
+    test_register_vfs();
     test_run_all(&g_serial);
 
     /* --- Post-tests: enable interrupts and enter the scheduler idle loop.

@@ -12,6 +12,9 @@
 #include "slab.h"
 #include "elf.h"
 #include "../drivers/serial.h"
+#include "../fs/ext2.h"
+#include "../fs/vfs.h"
+#include "../kernel/kheap.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -197,20 +200,41 @@ static int64_t sys_write(uint64_t *frame) {
     const char *buf = (const char *)frame[SC_OFF_RSI / 8];
     size_t count    = (size_t)frame[SC_OFF_RDX / 8];
 
-    if (fd != 1) return -1;
-    if (!validate_user_pointer(buf, count)) return -1;
-
-    serial_dev_t *s = g_sc_serial;
-    if (!s) return -1;
-    for (size_t i = 0; i < count; i++) {
-        serial_write_char(s, buf[i]);
+    /* fd 1 = serial (stdout). */
+    if (fd == 1) {
+        if (!validate_user_pointer(buf, count)) return -1;
+        serial_dev_t *s = g_sc_serial;
+        if (!s) return -1;
+        for (size_t i = 0; i < count; i++) {
+            serial_write_char(s, buf[i]);
+        }
+        return (int64_t)count;
     }
-    return (int64_t)count;
+
+    /* fd >= 2 = ext2 file. */
+    task_t *cur = task_get_current();
+    if (!cur) return -1;
+    if (fd < 0 || fd >= TASK_MAX_FDS) return -1;
+    if (!cur->fd_table[fd].ops || !cur->fd_table[fd].ops->write) return -1;
+    if (!validate_user_pointer(buf, count)) return -1;
+    return cur->fd_table[fd].ops->write(fd, buf, count, cur->fd_table[fd].data);
 }
 
 static int64_t sys_read(uint64_t *frame) {
-    (void)frame;
-    return -1;
+    int fd       = (int)frame[SC_OFF_RDI / 8];
+    void *buf    = (void *)frame[SC_OFF_RSI / 8];
+    size_t count = (size_t)frame[SC_OFF_RDX / 8];
+
+    /* fd 1 = serial out (not readable, return error). */
+    if (fd == 1) return -1;
+
+    /* fd >= 2 = ext2 file. */
+    task_t *cur = task_get_current();
+    if (!cur) return -1;
+    if (fd < 0 || fd >= TASK_MAX_FDS) return -1;
+    if (!cur->fd_table[fd].ops || !cur->fd_table[fd].ops->read) return -1;
+    if (!validate_user_pointer(buf, count)) return -1;
+    return cur->fd_table[fd].ops->read(fd, buf, count, cur->fd_table[fd].data);
 }
 
 static int64_t sys_exit(uint64_t *frame) {
@@ -528,19 +552,146 @@ static int64_t sys_execve(uint64_t *frame) {
 }
 
 /* =========================================================================
- * open / close (stubs — full implementation requires VFS)
+ * open / close — VFS file descriptor operations
  * ========================================================================= */
 
 static int64_t sys_open(uint64_t *frame) {
-    (void)frame;
-    /* TODO: Implement when VFS is ready. */
-    return -1;
+    const char *user_path = (const char *)frame[SC_OFF_RDI / 8];
+    uint64_t flags        = frame[SC_OFF_RSI / 8];
+
+    /* Validate full user string before kernel copy (prevents #PF on unmapped pages). */
+    int path_len = validate_user_string(user_path, EXT2_MAX_PATH);
+    if (path_len < 0) return -1;
+
+    /* Copy path to kernel buffer. */
+    char kpath[EXT2_MAX_PATH];
+    const char *src = user_path;
+    int i = 0;
+    while (src[i] && i < EXT2_MAX_PATH - 1) { kpath[i] = src[i]; i++; }
+    kpath[i] = '\0';
+
+    return (int64_t)vfs_open(kpath, (uint32_t)flags);
 }
 
 static int64_t sys_close(uint64_t *frame) {
-    (void)frame;
-    /* TODO: Implement when VFS is ready. */
-    return -1;
+    int fd = (int)frame[SC_OFF_RDI / 8];
+
+    task_t *cur = task_get_current();
+    if (!cur) return -1;
+    if (fd < 0 || fd >= TASK_MAX_FDS) return -1;
+    if (!cur->fd_table[fd].ops) return -1;
+
+    if (cur->fd_table[fd].ops->close)
+        cur->fd_table[fd].ops->close(fd, cur->fd_table[fd].data);
+
+    memset(&cur->fd_table[fd], 0, sizeof(file_t));
+    return 0;
+}
+
+/* =========================================================================
+ * fstat / lseek / unlink / getdents / rename (Phase 9)
+ * ========================================================================= */
+
+static int64_t sys_fstat(uint64_t *frame) {
+    int fd = (int)frame[SC_OFF_RDI / 8];
+    void *user_buf = (void *)frame[SC_OFF_RSI / 8];
+
+    if (!validate_user_pointer(user_buf, sizeof(ext2_stat_t))) return -1;
+
+    task_t *cur = task_get_current();
+    if (!cur || fd < 0 || fd >= TASK_MAX_FDS) return -1;
+    if (!cur->fd_table[fd].ops) return -1;
+
+    /* We need the inode number from the ext2_file_t data. */
+    ext2_file_t *file = (ext2_file_t *)cur->fd_table[fd].data;
+    if (!file) return -1;
+
+    ext2_stat_t st;
+    if (ext2_stat(file->ino, &st) != EXT2_OK) return -1;
+
+    memcpy(user_buf, &st, sizeof(ext2_stat_t));
+    return 0;
+}
+
+static int64_t sys_lseek(uint64_t *frame) {
+    int fd = (int)frame[SC_OFF_RDI / 8];
+    int64_t offset = (int64_t)frame[SC_OFF_RSI / 8];
+    int whence = (int)frame[SC_OFF_RDX / 8];
+
+    task_t *cur = task_get_current();
+    if (!cur || fd < 0 || fd >= TASK_MAX_FDS) return -1;
+    if (!cur->fd_table[fd].ops) return -1;
+
+    ext2_file_t *file = (ext2_file_t *)cur->fd_table[fd].data;
+    if (!file) return -1;
+
+    ext2_stat_t st;
+    if (ext2_stat(file->ino, &st) != EXT2_OK) return -1;
+
+    int64_t new_pos;
+    switch (whence) {
+        case EXT2_SEEK_SET: new_pos = offset; break;
+        case EXT2_SEEK_CUR: new_pos = (int64_t)file->offset + offset; break;
+        case EXT2_SEEK_END: new_pos = (int64_t)st.size + offset; break;
+        default: return -1;
+    }
+
+    if (new_pos < 0) new_pos = 0;
+    file->offset = (uint64_t)new_pos;
+    return new_pos;
+}
+
+static int64_t sys_unlink(uint64_t *frame) {
+    const char *user_path = (const char *)frame[SC_OFF_RDI / 8];
+    if (!validate_user_string(user_path, EXT2_MAX_PATH)) return -1;
+
+    char kpath[EXT2_MAX_PATH];
+    const char *src = user_path;
+    int i = 0;
+    while (src[i] && i < EXT2_MAX_PATH - 1) { kpath[i] = src[i]; i++; }
+    kpath[i] = '\0';
+
+    return (int64_t)vfs_unlink(kpath);
+}
+
+static int64_t sys_getdents(uint64_t *frame) {
+    int fd = (int)frame[SC_OFF_RDI / 8];
+    void *user_buf = (void *)frame[SC_OFF_RSI / 8];
+    uint32_t count = (uint32_t)frame[SC_OFF_RDX / 8];
+
+    if (!validate_user_pointer(user_buf, count)) return -1;
+
+    task_t *cur = task_get_current();
+    if (!cur || fd < 0 || fd >= TASK_MAX_FDS) return -1;
+    if (!cur->fd_table[fd].ops) return -1;
+
+    ext2_file_t *file = (ext2_file_t *)cur->fd_table[fd].data;
+    if (!file) return -1;
+
+    int32_t result = ext2_getdents(file->ino, &file->offset, user_buf, count);
+    return (int64_t)result;
+}
+
+static int64_t sys_rename(uint64_t *frame) {
+    const char *user_old = (const char *)frame[SC_OFF_RDI / 8];
+    const char *user_new = (const char *)frame[SC_OFF_RSI / 8];
+
+    if (!validate_user_string(user_old, EXT2_MAX_PATH)) return -1;
+    if (!validate_user_string(user_new, EXT2_MAX_PATH)) return -1;
+
+    char old_path[EXT2_MAX_PATH];
+    const char *src = user_old;
+    int i = 0;
+    while (src[i] && i < EXT2_MAX_PATH - 1) { old_path[i] = src[i]; i++; }
+    old_path[i] = '\0';
+
+    char new_path[EXT2_MAX_PATH];
+    src = user_new;
+    i = 0;
+    while (src[i] && i < EXT2_MAX_PATH - 1) { new_path[i] = src[i]; i++; }
+    new_path[i] = '\0';
+
+    return (int64_t)vfs_rename(old_path, new_path);
 }
 
 /* =========================================================================
@@ -563,6 +714,11 @@ static syscall_fn_t syscall_table[] = {
     [SYS_EXECVE]  = sys_execve,
     [SYS_OPEN]    = sys_open,
     [SYS_CLOSE]   = sys_close,
+    [SYS_FSTAT]   = sys_fstat,
+    [SYS_LSEEK]   = sys_lseek,
+    [SYS_UNLINK]  = sys_unlink,
+    [SYS_GETDENTS]= sys_getdents,
+    [SYS_RENAME]  = sys_rename,
 };
 
 /* =========================================================================

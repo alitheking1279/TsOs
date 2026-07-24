@@ -51,9 +51,14 @@ extern "C" {
 #define SYS_EXECVE      59
 #define SYS_OPEN        60
 #define SYS_CLOSE       61
+#define SYS_FSTAT       70
+#define SYS_LSEEK       71
+#define SYS_UNLINK      72
+#define SYS_GETDENTS    73
+#define SYS_RENAME      74
 
 /** Total number of syscall slots. */
-#define SYS_COUNT       62
+#define SYS_COUNT       75
 
 /** Invalid/unimplemented syscall number. */
 #define SYS_INVALID     (-1)

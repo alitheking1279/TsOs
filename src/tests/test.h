@@ -5,7 +5,7 @@
 
 /* Raised from 256 → 512 to accommodate the full test suite.
  * At 256 the registry silently drops any test registered after slot 255. */
-#define TEST_MAX 512
+#define TEST_MAX 544
 
 typedef void (*test_fn)(serial_dev_t *dev);
 

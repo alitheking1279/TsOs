@@ -105,6 +105,38 @@ long user_execve(const void *elf_data, size_t elf_size) {
     return user_syscall2(SYS_EXECVE, (long)elf_data, (long)elf_size);
 }
 
+long user_open(const char *path, int flags) {
+    return user_syscall2(SYS_OPEN, (long)path, (long)flags);
+}
+
+long user_close(int fd) {
+    return user_syscall1(SYS_CLOSE, (long)fd);
+}
+
+long user_read(int fd, void *buf, size_t count) {
+    return user_syscall3(SYS_READ, (long)fd, (long)buf, (long)count);
+}
+
+long user_fstat(int fd, void *buf) {
+    return user_syscall2(SYS_FSTAT, (long)fd, (long)buf);
+}
+
+long user_lseek(int fd, long offset, int whence) {
+    return user_syscall3(SYS_LSEEK, (long)fd, offset, (long)whence);
+}
+
+long user_unlink(const char *path) {
+    return user_syscall1(SYS_UNLINK, (long)path);
+}
+
+long user_getdents(int fd, void *buf, unsigned int count) {
+    return user_syscall3(SYS_GETDENTS, (long)fd, (long)buf, (long)count);
+}
+
+long user_rename(const char *old, const char *new_name) {
+    return user_syscall2(SYS_RENAME, (long)old, (long)new_name);
+}
+
 /* =========================================================================
  * User-mode entry trampoline
  * ========================================================================= */

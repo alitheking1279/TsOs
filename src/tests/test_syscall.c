@@ -21,9 +21,9 @@
 #include "../kernel/task.h"
 #include <stdint.h>
 
-/* ---- Test: SYS_COUNT is 60 ---- */
+/* ---- Test: SYS_COUNT matches expected slot count ---- */
 static void test_sc_sys_count(serial_dev_t *dev) {
-    ASSERT_EQ(dev, SYS_COUNT, 62);
+    ASSERT_EQ(dev, SYS_COUNT, 75);
 }
 
 /* ---- Test: syscall numbers are sequential starting at 0 ---- */

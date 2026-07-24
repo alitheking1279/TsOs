@@ -13,7 +13,7 @@ CC      = gcc
 CFLAGS  = -m64 -ffreestanding -fno-builtin -fno-stack-protector \
           -mno-red-zone -mgeneral-regs-only \
           -nostartfiles -nodefaultlibs -Wall -Wextra -Isrc -c \
-          -O2
+          -O2 -D_FORTIFY_SOURCE=0
 
 ASM     = nasm
 ASMFLAGS = -f elf64
@@ -52,12 +52,17 @@ C_SOURCES   = src/kernel/main.c \
               src/kernel/pmm_buddy.c \
               src/kernel/mem_stats.c \
               src/drivers/pit.c \
+              src/drivers/ata.c \
               src/kernel/timer.c \
               src/kernel/task.c \
               src/kernel/scheduler.c \
               src/kernel/mlfq.c \
               src/kernel/syscall.c \
               src/kernel/elf.c \
+              src/fs/block_dev.c \
+              src/fs/bcache.c \
+              src/fs/ext2.c \
+              src/fs/vfs.c \
               src/lib/string.c \
               src/lib/print.c \
               src/drivers/serial.c \
@@ -84,7 +89,20 @@ C_SOURCES   = src/kernel/main.c \
               src/tests/test_syscall.c \
               src/tests/test_validation.c \
               src/tests/test_usermode.c \
-              src/tests/test_elf.c
+              src/tests/test_elf.c \
+              src/tests/test_ata.c \
+              src/tests/test_block_dev.c \
+              src/tests/test_bcache.c \
+              src/tests/test_ext2_struct.c \
+              src/tests/test_ext2_inode_ops.c \
+              src/tests/test_ext2_bitmap.c \
+              src/tests/test_ext2_block_map.c \
+              src/tests/test_ext2_fileio.c \
+              src/tests/test_ext2_dir.c \
+              src/tests/test_ext2_path.c \
+              src/tests/test_ext2_syscall.c \
+              src/tests/test_ext2_phase9.c \
+              src/tests/test_vfs.c
 
 # -----------------------------------------------------------------------------
 # Object lists
@@ -114,6 +132,7 @@ C_OBJECTS   = $(BUILD)/main.o \
               $(BUILD)/pmm_buddy.o \
               $(BUILD)/mem_stats.o \
               $(BUILD)/pit.o \
+              $(BUILD)/ata.o \
               $(BUILD)/timer.o \
               $(BUILD)/task.o \
               $(BUILD)/scheduler.o \
@@ -123,6 +142,9 @@ C_OBJECTS   = $(BUILD)/main.o \
               $(BUILD)/print.o \
               $(BUILD)/serial.o \
               $(BUILD)/elf.o \
+              $(BUILD)/block_dev.o \
+              $(BUILD)/bcache.o \
+              $(BUILD)/ext2.o \
               $(BUILD)/user_main.o \
               $(BUILD)/test.o \
               $(BUILD)/test_serial.o \
@@ -146,7 +168,21 @@ C_OBJECTS   = $(BUILD)/main.o \
               $(BUILD)/test_syscall.o \
               $(BUILD)/test_validation.o \
               $(BUILD)/test_usermode.o \
-              $(BUILD)/test_elf.o
+              $(BUILD)/test_elf.o \
+              $(BUILD)/test_ata.o \
+              $(BUILD)/test_block_dev.o \
+              $(BUILD)/test_bcache.o \
+              $(BUILD)/test_ext2_struct.o \
+              $(BUILD)/test_ext2_inode_ops.o \
+              $(BUILD)/test_ext2_bitmap.o \
+              $(BUILD)/test_ext2_block_map.o \
+              $(BUILD)/test_ext2_fileio.o \
+              $(BUILD)/test_ext2_dir.o \
+              $(BUILD)/test_ext2_path.o \
+              $(BUILD)/test_ext2_syscall.o \
+    $(BUILD)/test_ext2_phase9.o \
+    $(BUILD)/test_vfs.o \
+    $(BUILD)/vfs.o
 
 OBJECTS = $(ASM_OBJECTS) $(C_OBJECTS)
 
@@ -166,13 +202,21 @@ TsOs.iso: $(OBJECTS)
 #   -serial null         COM2 -> /dev/null   (absorbs write_char_ok 'X' etc.)
 #   -display none        headless (no VGA window)
 #   -no-reboot           on triple-fault, exit instead of loop
-test: TsOs.iso
+#   -drive               secondary IDE drive for block device tests
+test: TsOs.iso disk.img
 	qemu-system-x86_64 -cdrom TsOs.iso \
+	    -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
 	    -serial stdio -serial null \
 	    -display none -no-reboot -accel tcg
 
-run: TsOs.iso
-	qemu-system-x86_64 -cdrom TsOs.iso -serial stdio -serial null
+run: TsOs.iso disk.img
+	qemu-system-x86_64 -cdrom TsOs.iso \
+	    -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
+	    -serial stdio -serial null
+
+# Create a blank 4 MiB disk image for block device tests (512-byte sectors).
+disk.img:
+	dd if=/dev/zero of=disk.img bs=1M count=4 2>/dev/null
 
 # =============================================================================
 # Assembly build rules — explicit (not pattern) to control output filenames
@@ -222,6 +266,10 @@ $(BUILD)/%.o: src/lib/%.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $< -o $@
 
+$(BUILD)/%.o: src/fs/%.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $< -o $@
+
 $(BUILD)/%.o: src/user/%.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $< -o $@
@@ -243,6 +291,6 @@ debug: CFLAGS += -O0 -g
 debug: all
 
 clean:
-	rm -rf $(BUILD) iso/boot/kernel.bin TsOs.iso
+	rm -rf $(BUILD) iso/boot/kernel.bin TsOs.iso disk.img
 
 .PHONY: all test run lint clean debug
