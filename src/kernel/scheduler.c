@@ -16,6 +16,7 @@
 #include "task.h"
 #include "slab.h"
 #include "gdt.h"
+#include "syscall.h"
 #include "vmm.h"
 #include "../drivers/serial.h"
 #include <stdint.h>
@@ -180,8 +181,13 @@ void scheduler_tick(interrupt_frame_t *frame) {
         next = g_idle_task;
     }
 
-    /* If the next task is the same as the current, no switch needed. */
-    if (next == prev) return;
+    /* If the next task is the same as the current, no switch needed.
+     * But we must fix the state: mlfq_decay set it to READY when it
+     * re-enqueued the task. Since we're staying on-CPU, mark it RUNNING. */
+    if (next == prev) {
+        prev->state = TASK_STATE_RUNNING;
+        return;
+    }
 
     /* Dequeue next from its queue (we're about to run it). */
     mlfq_dequeue(next);
@@ -191,8 +197,11 @@ void scheduler_tick(interrupt_frame_t *frame) {
     g_current = next;
     task_set_current(next);
 
-    /* Update TSS.RSP0 so ring-3 → ring-0 transitions use the right kernel stack. */
+    /* Update TSS.RSP0 so ring-3 -> ring-0 transitions use the right kernel stack. */
     tss_set_rsp0(next->kernel_stack_base + next->kernel_stack_size);
+
+    /* Update per-CPU kernel_rsp so syscall_entry has the right stack. */
+    syscall_set_kernel_rsp(next->kernel_rsp);
 
     /* --- Pre-context-switch: FPU save + CR3 switch --- */
     /* Save previous task's FPU state (kernel address space is active, safe to access). */
@@ -226,4 +235,23 @@ task_t *scheduler_get_current(void) {
 
 uint64_t scheduler_get_task_count(void) {
     return g_ready_count;
+}
+
+void scheduler_wake_task(task_t *task) {
+    if (!task) return;
+    if (task->state != TASK_STATE_BLOCKED) return;
+
+    task->state = TASK_STATE_READY;
+    mlfq_enqueue(task, 0);
+    g_ready_count++;
+}
+
+void scheduler_unqueue_task(task_t *task) {
+    if (!task) return;
+    if (task->state != TASK_STATE_RUNNING && task->state != TASK_STATE_READY) return;
+
+    mlfq_dequeue(task);
+    if (task != g_idle_task) {
+        g_ready_count--;
+    }
 }

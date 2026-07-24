@@ -12,7 +12,8 @@
 CC      = gcc
 CFLAGS  = -m64 -ffreestanding -fno-builtin -fno-stack-protector \
           -mno-red-zone -mgeneral-regs-only \
-          -nostartfiles -nodefaultlibs -Wall -Wextra -Isrc -c
+          -nostartfiles -nodefaultlibs -Wall -Wextra -Isrc -c \
+          -O2
 
 ASM     = nasm
 ASMFLAGS = -f elf64
@@ -32,7 +33,8 @@ BUILD   = build
 ASM_SOURCES = src/boot/boot.asm \
               src/kernel/gdt_flush.asm \
               src/kernel/isr_stubs.asm \
-              src/kernel/context_switch.asm
+              src/kernel/context_switch.asm \
+              src/kernel/syscall_entry.asm
 
 # C sources — pattern rules below match by source directory.
 C_SOURCES   = src/kernel/main.c \
@@ -54,9 +56,12 @@ C_SOURCES   = src/kernel/main.c \
               src/kernel/task.c \
               src/kernel/scheduler.c \
               src/kernel/mlfq.c \
+              src/kernel/syscall.c \
+              src/kernel/elf.c \
               src/lib/string.c \
               src/lib/print.c \
               src/drivers/serial.c \
+              src/user/user_main.c \
               src/tests/test.c \
               src/tests/test_serial.c \
               src/tests/test_boot.c \
@@ -75,7 +80,11 @@ C_SOURCES   = src/kernel/main.c \
               src/tests/test_scheduler.c \
               src/tests/test_spinlock_rflags.c \
               src/tests/test_mlfq.c \
-              src/tests/test_zombie.c
+              src/tests/test_zombie.c \
+              src/tests/test_syscall.c \
+              src/tests/test_validation.c \
+              src/tests/test_usermode.c \
+              src/tests/test_elf.c
 
 # -----------------------------------------------------------------------------
 # Object lists
@@ -87,7 +96,8 @@ C_SOURCES   = src/kernel/main.c \
 ASM_OBJECTS = $(BUILD)/boot.o \
               $(BUILD)/gdt_asm.o \
               $(BUILD)/isr_stubs_asm.o \
-              $(BUILD)/context_switch_asm.o
+              $(BUILD)/context_switch_asm.o \
+              $(BUILD)/syscall_entry_asm.o
 
 C_OBJECTS   = $(BUILD)/main.o \
               $(BUILD)/gdt.o \
@@ -108,9 +118,12 @@ C_OBJECTS   = $(BUILD)/main.o \
               $(BUILD)/task.o \
               $(BUILD)/scheduler.o \
               $(BUILD)/mlfq.o \
+              $(BUILD)/syscall.o \
               $(BUILD)/string.o \
               $(BUILD)/print.o \
               $(BUILD)/serial.o \
+              $(BUILD)/elf.o \
+              $(BUILD)/user_main.o \
               $(BUILD)/test.o \
               $(BUILD)/test_serial.o \
               $(BUILD)/test_boot.o \
@@ -129,7 +142,11 @@ C_OBJECTS   = $(BUILD)/main.o \
               $(BUILD)/test_scheduler.o \
               $(BUILD)/test_spinlock_rflags.o \
               $(BUILD)/test_mlfq.o \
-              $(BUILD)/test_zombie.o
+              $(BUILD)/test_zombie.o \
+              $(BUILD)/test_syscall.o \
+              $(BUILD)/test_validation.o \
+              $(BUILD)/test_usermode.o \
+              $(BUILD)/test_elf.o
 
 OBJECTS = $(ASM_OBJECTS) $(C_OBJECTS)
 
@@ -180,6 +197,11 @@ $(BUILD)/context_switch_asm.o: src/kernel/context_switch.asm
 	@mkdir -p $(BUILD)
 	$(ASM) $(ASMFLAGS) $< -o $@
 
+# syscall_entry.asm builds to syscall_entry_asm.o
+$(BUILD)/syscall_entry_asm.o: src/kernel/syscall_entry.asm
+	@mkdir -p $(BUILD)
+	$(ASM) $(ASMFLAGS) $< -o $@
+
 # =============================================================================
 # C build rules — pattern rules per source directory
 # =============================================================================
@@ -200,15 +222,27 @@ $(BUILD)/%.o: src/lib/%.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $< -o $@
 
+$(BUILD)/%.o: src/user/%.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $< -o $@
+
 # =============================================================================
 # Utility targets
 # =============================================================================
 
 # Compile all C sources with -Werror to surface warnings as errors.
 lint:
-	$(CC) $(CFLAGS) -Werror $(C_SOURCES)
+	@for src in $(C_SOURCES); do \
+		echo "Linting $$src"; \
+		$(CC) $(CFLAGS) -Werror $$src -o /dev/null || exit 1; \
+	done
+	@echo "Lint passed."
+
+# Debug build: no optimization, full symbols.
+debug: CFLAGS += -O0 -g
+debug: all
 
 clean:
 	rm -rf $(BUILD) iso/boot/kernel.bin TsOs.iso
 
-.PHONY: all test run lint clean
+.PHONY: all test run lint clean debug

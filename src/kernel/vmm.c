@@ -222,23 +222,68 @@ vmm_status_t vmm_destroy_address_space(address_space_t *as) {
         return VMM_ERR_INVALID;
     }
 
-    VMM_LOG_INF("DESTROY: freeing user page tables...\r\n");
+    VMM_LOG_INF("DESTROY: freeing user page tables and frames...\r\n");
 
-    /* Free all user-mode page table pages (levels 1, 2, 3).
-     * Level 3 = PDPT sub-tables (256 user entries in PML4).
-     * We recurse from each user PDPT entry.
-     * Skip entry 0 — it is shared with the kernel (copied from
-     * the kernel PML4 at create time) and must not be freed. */
-    for (int i = 1; i < 256; i++) {
+    /* Walk all user PML4 entries (0-255) and free leaf frames + page tables.
+     * Skip entries shared with the kernel address space. */
+    address_space_t *kspace = vmm_get_kernel_address_space();
+    for (int i = 0; i < 256; i++) {
         uint64_t entry = as->pml4[i];
         if (!(entry & PTE_PRESENT)) continue;
 
-        /* The PDPT page itself is at pte_addr(entry).
-         * Recurse to free PD and PT pages under it. */
+        /* Skip entries shared with the kernel address space. */
+        if (kspace && kspace->pml4 && entry == kspace->pml4[i]) continue;
+
         uint64_t pdpt_phys = pte_addr(entry);
         uint64_t *pdpt = pt_phys_to_virt(pdpt_phys);
 
-        pt_free_recursive(pdpt, 2);  /* level 2 = free PD and PT pages */
+        /* Walk PDPT entries. */
+        for (int j = 0; j < PT_ENTRIES; j++) {
+            uint64_t pdpe = pdpt[j];
+            if (!(pdpe & PTE_PRESENT)) continue;
+
+            if (pdpe & PTE_PS) {
+                /* 1 GiB huge page — free the frame. */
+                pmm_free_frame(pte_addr(pdpe));
+                continue;
+            }
+
+            uint64_t pd_phys = pte_addr(pdpe);
+            uint64_t *pd = pt_phys_to_virt(pd_phys);
+
+            /* Walk PD entries. */
+            for (int k = 0; k < PT_ENTRIES; k++) {
+                uint64_t pde = pd[k];
+                if (!(pde & PTE_PRESENT)) continue;
+
+                if (pde & PTE_PS) {
+                    /* 2 MiB huge page — free the frame. */
+                    pmm_free_frame(pte_addr(pde));
+                    continue;
+                }
+
+                uint64_t pt_phys = pte_addr(pde);
+                uint64_t *pt = pt_phys_to_virt(pt_phys);
+
+                /* Walk PT entries — these are leaf PTEs. */
+                for (int m = 0; m < PT_ENTRIES; m++) {
+                    uint64_t pte = pt[m];
+                    if (!(pte & PTE_PRESENT)) {
+                        /* Demand PTEs have no physical frame — just skip. */
+                        continue;
+                    }
+
+                    /* Free the physical frame mapped by this leaf PTE. */
+                    pmm_free_frame(pte_addr(pte));
+                }
+
+                /* Free the PT page itself. */
+                pmm_free_frame(pt_phys);
+            }
+
+            /* Free the PD page itself. */
+            pmm_free_frame(pd_phys);
+        }
 
         /* Free the PDPT page itself. */
         pmm_free_frame(pdpt_phys);
@@ -251,7 +296,7 @@ vmm_status_t vmm_destroy_address_space(address_space_t *as) {
     as->pml4_phys = 0;
     pmm_free_frame(pml4_phys);
 
-    VMM_LOG_INF("DESTROY: address space freed\r\n");
+    VMM_LOG_INF("DESTROY: address space freed (frames + tables released)\r\n");
     return VMM_OK;
 }
 
@@ -333,7 +378,7 @@ vmm_status_t vmm_unmap_page(address_space_t *as, uint64_t vaddr) {
 
     /* Walk to the leaf PTE (don't create). */
     uint64_t *pte = pt_walk_to_leaf(as->pml4, vaddr, false, 0);
-    if (!pte || !(*pte & PTE_PRESENT)) {
+    if (!pte || !(*pte & (PTE_PRESENT | PTE_DEMAND))) {
         VMM_LOG_WRN("UNMAP: vaddr ");
         vmm_log_hex64(vaddr);
         VMM_LOG_WRN(" not mapped\r\n");
@@ -356,7 +401,8 @@ vmm_status_t vmm_unmap_page(address_space_t *as, uint64_t vaddr) {
     VMM_LOG_INF(")\r\n");
 
     /* Free intermediate page tables that became empty after this unmap.
-     * Only user-space entries (PML4 index 1-255) may be freed. */
+     * Only user-space entries (PML4 index 1-255) may be freed.
+     * Note: demand PTEs (no physical frame) do NOT call pmm_free_frame. */
     pt_cleanup_empty_tables(as->pml4, vaddr);
 
     return VMM_OK;
@@ -558,6 +604,13 @@ vmm_status_t vmm_clone_address_space(address_space_t *src,
 
                 for (int m = 0; m < PT_ENTRIES; m++) {
                     uint64_t src_leaf = src_pt[m];
+
+                    /* Copy demand PTEs as-is — no physical frame to share. */
+                    if ((src_leaf & PTE_DEMAND) && !(src_leaf & PTE_PRESENT)) {
+                        dst_pt[m] = src_leaf;
+                        continue;
+                    }
+
                     if (!(src_leaf & PTE_PRESENT)) {
                         dst_pt[m] = 0;
                         continue;
@@ -628,12 +681,26 @@ vmm_status_t vmm_unmap_and_free(address_space_t *as, uint64_t vaddr) {
 
     /* Walk to the leaf PTE. */
     uint64_t *pte = pt_walk_to_leaf(as->pml4, vaddr, false, 0);
-    if (!pte || !(*pte & PTE_PRESENT)) {
+    if (!pte) {
+        return VMM_ERR_NOT_MAPPED;
+    }
+
+    uint64_t old_pte_val = *pte;
+
+    /* Handle demand PTEs (no physical frame allocated). */
+    if (old_pte_val & PTE_DEMAND) {
+        *pte = 0;
+        pt_invlpg((void *)vaddr);
+        pt_cleanup_empty_tables(as->pml4, vaddr);
+        return VMM_OK;
+    }
+
+    if (!(old_pte_val & PTE_PRESENT)) {
         return VMM_ERR_NOT_MAPPED;
     }
 
     /* Save physical address before clearing. */
-    uint64_t phys = pte_addr(*pte);
+    uint64_t phys = pte_addr(old_pte_val);
 
     /* Clear the PTE and flush TLB. */
     *pte = 0;
@@ -650,6 +717,60 @@ vmm_status_t vmm_unmap_and_free(address_space_t *as, uint64_t vaddr) {
 
     /* Free intermediate page tables that became empty. */
     pt_cleanup_empty_tables(as->pml4, vaddr);
+
+    return VMM_OK;
+}
+
+/* =========================================================================
+ * Demand-Page Mapping (Lazy Allocation)
+ * ========================================================================= */
+
+vmm_status_t vmm_map_demand_page(address_space_t *as, uint64_t vaddr,
+                                 uint64_t flags) {
+    if (!g_vmm_initialized) return VMM_ERR_NOT_INIT;
+
+    vmm_status_t st;
+    st = validate_aspace(as);
+    if (st != VMM_OK) return st;
+
+    st = validate_vaddr(vaddr);
+    if (st != VMM_OK) return st;
+
+    /* Walk to the leaf PTE, creating intermediate tables as needed.
+     * Intermediate entries use PRESENT | WRITABLE (same as vmm_map_page). */
+    uint64_t *pte = pt_walk_to_leaf(as->pml4, vaddr, true,
+                                     PT_DEFAULT_FLAGS);
+    if (!pte) {
+        VMM_LOG_ERR("DEMAND: walk failed for vaddr ");
+        vmm_log_hex64(vaddr);
+        VMM_LOG_ERR("\r\n");
+        return VMM_ERR_NO_MEM;
+    }
+
+    /* If already mapped (present or demand), don't overwrite. */
+    if (*pte & (PTE_PRESENT | PTE_DEMAND)) {
+        return VMM_ERR_ALREADY_MAP;
+    }
+
+    /* Install a non-present PTE with PTE_DEMAND set.
+     * The page fault handler will allocate a frame on first access. */
+    uint64_t demand_flags = (flags & ~PTE_ADDR_MASK) | PTE_DEMAND;
+    /* Explicitly clear PRESENT — this is a demand page. */
+    demand_flags &= ~PTE_PRESENT;
+    *pte = demand_flags;  /* No physical address — address field is zero. */
+
+    pt_invlpg((void *)vaddr);
+
+    VMM_LOG_DBG("DEMAND: mapped vaddr ");
+    vmm_log_hex64(vaddr);
+    VMM_LOG_DBG(" flags=");
+    {
+        char fbuf[8];
+        format_flags(demand_flags, fbuf, sizeof(fbuf));
+        VMM_LOG_DBG("[");
+        vmm_log_write(1, fbuf);
+        VMM_LOG_DBG("]\r\n");
+    }
 
     return VMM_OK;
 }

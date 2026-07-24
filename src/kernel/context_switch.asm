@@ -45,15 +45,6 @@ section .text
 ; task_t field offsets (must match task.h layout)
 %define TASK_KERNEL_RSP_OFFSET   0       ; offset of kernel_rsp field
 
-; task_t fields that context_switch accesses:
-;   offset 0:  kernel_rsp   (uint64_t)
-;   offset 8:  rbp          (uint64_t)
-;   offset 16: rbx          (uint64_t)
-;   offset 24: r12          (uint64_t)
-;   offset 32: r13          (uint64_t)
-;   offset 40: r14          (uint64_t)
-;   offset 48: r15          (uint64_t)
-
 global context_switch
 context_switch:
     ; ------------------------------------------------------------------
@@ -72,7 +63,6 @@ context_switch:
     ; Save prev's RSP (which now points to the saved register block)
     ; into prev->kernel_rsp.
     mov [rdi + TASK_KERNEL_RSP_OFFSET], rsp
-    ; rdi = prev, store current RSP at offset 0 (kernel_rsp)
 
     ; ------------------------------------------------------------------
     ; LOAD next task's context

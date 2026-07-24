@@ -414,11 +414,13 @@ uint64_t pmm_alloc_frame(void) {
         spin_unlock(&g_pmm_lock, pmm_rflags);
 
         uint64_t addr = _frame_to_addr(frame);
+#ifdef PMM_TRACE
         pmm_log_str("[PMM] ALLOC frame ");
         pmm_log_uint64(frame);
         pmm_log_str(" @ ");
         pmm_log_hex64(addr);
         pmm_log_str("\r\n");
+#endif
         return addr;
     }
 
@@ -506,11 +508,13 @@ pmm_status_t pmm_free_frame(uint64_t addr) {
 
     spin_unlock(&g_pmm_lock, pmm_rflags);
 
+#ifdef PMM_TRACE
     pmm_log_str("[PMM] FREE  frame ");
     pmm_log_uint64(frame);
     pmm_log_str(" @ ");
     pmm_log_hex64(addr);
     pmm_log_str("\r\n");
+#endif
     return PMM_OK;
 }
 

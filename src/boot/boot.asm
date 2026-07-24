@@ -225,7 +225,7 @@ enable_paging:
 
     mov ecx, 0xC0000080         ; IA32_EFER MSR
     rdmsr
-    or eax, 1 << 8 | 1 << 11   ; EFER.LME | EFER.NXE
+    or eax, 1 << 0 | 1 << 8 | 1 << 11   ; EFER.SCE | EFER.LME | EFER.NXE
     wrmsr
 
     mov eax, cr0

@@ -719,8 +719,11 @@ int kheap_verify_integrity(void) {
         return 0;
     }
 
-    /* visited[page] = 1 if we have seen this page on a free list. */
-    /* Use a stack-local array — 4096 bytes is fine on kernel stack. */
+    /* Acquire lock to prevent concurrent kmalloc/kfree during verification. */
+    uint64_t kh_rflags = spin_lock(&g_kheap_lock);
+
+    /* visited[page] = 1 if we have seen this page on a free list.
+     * Static to avoid a 4 KiB kernel stack allocation. Zeroed on each call. */
     static uint8_t visited[HEAP_PAGE_COUNT];
     for (uint32_t i = 0; i < HEAP_PAGE_COUNT; i++) visited[i] = 0;
 
@@ -786,5 +789,6 @@ int kheap_verify_integrity(void) {
         kh_str(" alloc_pages="); kh_uint64(g_allocated_pages); kh_str("\r\n");
     }
 
+    spin_unlock(&g_kheap_lock, kh_rflags);
     return ok;
 }

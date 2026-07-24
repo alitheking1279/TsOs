@@ -84,7 +84,7 @@ static inline uint32_t order_for_pages(uint32_t pages)
     if (pages <= 1) return 0;
     uint32_t order = 0;
     uint32_t block = 1;
-    while (block < pages) {
+    while (block < pages && order < PMM_BUDDY_MAX_ORDER - 1) {
         order++;
         block <<= 1;
     }
@@ -94,13 +94,23 @@ static inline uint32_t order_for_pages(uint32_t pages)
 static void push(uint32_t order, uint64_t addr)
 {
     buddy_node_t *n = pool_alloc();
-    if (!n) return;
+    if (!n) {
+        buddy_log("[BUDDY] FATAL: node pool exhausted — block at ");
+        buddy_log_hex(addr);
+        buddy_log(" order ");
+        buddy_log_u64(order);
+        buddy_log(" lost!\r\n");
+        /* Panic: pool exhaustion means free memory is permanently lost. */
+        extern void kernel_panic(const char *, void *);
+        kernel_panic("BUDDY: node pool exhausted", 0);
+        return;
+    }
     n->addr = addr;
     n->next = g_free_lists[order];
     g_free_lists[order] = n;
 }
 
-static int remove(uint32_t order, uint64_t addr)
+static int buddy_remove(uint32_t order, uint64_t addr)
 {
     buddy_node_t **pp = &g_free_lists[order];
     while (*pp) {
@@ -169,7 +179,7 @@ void pmm_buddy_init(void *serial_dev)
                     if (page_idx & (block_pages - 1)) {
                         /* Not aligned — try smaller order. */
                         order--;
-                        if (order > PMM_BUDDY_MAX_ORDER) order = PMM_BUDDY_MAX_ORDER - 1;
+                        if (order >= PMM_BUDDY_MAX_ORDER) order = PMM_BUDDY_MAX_ORDER - 1;
                         block_pages = (uint64_t)1 << order;
                         if (page_idx & (block_pages - 1)) {
                             /* Still not aligned — decrement until aligned. */

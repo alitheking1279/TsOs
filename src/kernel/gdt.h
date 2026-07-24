@@ -176,6 +176,29 @@ uint64_t gdt_get_address(void);
  */
 uint64_t gdt_get_tss_address(void);
 
+/* =========================================================================
+ * MSRs for SYSCALL/SYSRET (Intel SDM Vol.3A §3.3.1)
+ * ========================================================================= */
+
+/** Extended Feature Enable Register. */
+#define MSR_EFER            0xC0000080
+
+/** SYSCALL target address in long mode.
+ *  Bits [63:32] = target RIP, bits [31:16] = kernel CS, bits [15:0] = user CS. */
+#define MSR_STAR            0xC0000081
+
+/** SYSCALL RIP — target RIP for SYSCALL in long mode. */
+#define MSR_LSTAR           0xC0000082
+
+/** SYSCALL RFLAGS Mask — bits to clear in RFLAGS on SYSCALL entry. */
+#define MSR_SFMASK          0xC0000084
+
+/** Kernel GS Base — used for per-CPU data access via SWAPGS. */
+#define MSR_GS_BASE         0xC0000101
+
+/** SYSCALL entry point address (defined in syscall_entry.asm). */
+extern uint64_t syscall_entry_addr;
+
 #ifdef __cplusplus
 }
 #endif

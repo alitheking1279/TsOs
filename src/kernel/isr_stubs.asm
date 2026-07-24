@@ -67,10 +67,19 @@ isr%1:
 ;
 ; After GP register pushes, rsp points to the interrupt_frame_t struct
 ; which is passed as the first argument (rdi) to isr_common_handler.
+;
+; swapgs policy: Only swap GS-base when entering from Ring 3 (user mode).
+; If the CPU was already in Ring 0, kernel GS-base is active and swapping
+; would corrupt it.  We detect Ring 3 by checking CPL via the CS register.
 ; =============================================================================
 
 isr_common:
-    swapgs                          ; Switch to kernel GS-base on entry
+    ; Conditional swapgs: only if interrupted code was Ring 3 (CPL == 3).
+    ; test byte [rsp+24], 3 checks the RPL bits of the pushed CS.
+    test byte [rsp + 24], 3
+    jz .no_swapgs_entry
+    swapgs
+.no_swapgs_entry:
     push rax
     push rbx
     push rcx
@@ -108,7 +117,13 @@ isr_common:
     pop rax
 
     add rsp, 16                 ; skip vector + error_code
-    swapgs                          ; Restore user GS-base before returning
+    ; Conditional swapgs on exit: only if returning to Ring 3.
+    ; After our 16-byte skip, the CPU frame starts at rsp.
+    ; CS is at [rsp+8].
+    test byte [rsp + 8], 3
+    jz .no_swapgs_exit
+    swapgs
+.no_swapgs_exit:
     iretq
 
 ; =============================================================================

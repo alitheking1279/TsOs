@@ -44,6 +44,8 @@
 #include "timer.h"
 #include "scheduler.h"
 #include "task.h"
+#include "syscall.h"
+#include "elf.h"
 #include "../drivers/serial.h"
 #include "../lib/print.h"
 #include "../tests/test.h"
@@ -76,6 +78,10 @@ extern void test_register_pit(void);
 extern void test_register_spinlock_rflags(void);
 extern void test_register_mlfq(void);
 extern void test_register_zombie(void);
+extern void test_register_syscall(void);
+extern void test_register_validation(void);
+extern void test_register_usermode(void);
+extern void test_register_elf(void);
 
 /* =========================================================================
  * Fault handlers — diagnostic dumps for PMM-critical exceptions
@@ -147,52 +153,87 @@ static void handler_pf(interrupt_frame_t *frame) {
     uint64_t cr2;
     asm volatile ("mov %%cr2, %0" : "=r"(cr2));
 
-    /* --- Attempt demand-page resolution --- */
-    if (!(frame->error_code & 1) && va_is_kernel(cr2) &&
-        is_page_aligned(cr2)) {
-        uint64_t cr3_val;
-        asm volatile ("mov %%cr3, %0" : "=r"(cr3_val));
-        uint64_t *pml4 = pt_phys_to_virt(cr3_val);
+    /* Align CR2 down to page boundary for demand/COW resolution.
+     * The faulting address may be any byte within the page — the
+     * page-table walk always operates on the page-granularity base. */
+    uint64_t cr2_page = cr2 & ~0xFFFULL;
 
-        uint64_t pml4e = pml4[PML4_INDEX(cr2)];
-        if (pml4e & PTE_PRESENT) {
-            uint64_t *pdpt = pt_phys_to_virt(pte_addr(pml4e));
-            uint64_t pdpe = pdpt[PDPT_INDEX(cr2)];
+    /* --- Attempt demand-page resolution (kernel and user) --- */
+    if (!(frame->error_code & 1) && (va_is_kernel(cr2_page) || va_is_user(cr2_page))) {
+        /* Bounds check: only resolve demand pages within known valid regions.
+         * Kernel heap: [HEAP_BASE, HEAP_END)
+         * User stack:  [TASK_USER_STACK_BASE, TASK_USER_STACK_BASE + TASK_USER_STACK_SIZE)
+         * User heap:   checked dynamically via task->user_heap_start/brk
+         * User mmap:   NOT demand-resolved here (handled by PF with mmap lookup later)
+         * Anything else is an invalid access — fall through to panic. */
+        bool valid_demand = false;
 
-            if (pdpe & PTE_PRESENT) {
-                if (pdpe & PTE_PS) goto fault_halt;
+        if (va_is_kernel(cr2_page)) {
+            /* Kernel demand pages are always valid (kernel heap). */
+            valid_demand = true;
+        } else {
+            /* User space — validate the address is in a known region. */
+            task_t *cur_task = task_get_current();
+            if (cur_task) {
+                uint64_t stack_end = cur_task->user_stack_base + cur_task->user_stack_size;
+                if (cr2_page >= cur_task->user_stack_base && cr2_page < stack_end) {
+                    valid_demand = true;
+                } else if (cur_task->user_heap_start != 0 &&
+                           cr2_page >= cur_task->user_heap_start &&
+                           cr2_page < cur_task->user_heap_brk) {
+                    valid_demand = true;
+                }
+                /* Guard page: one page below the user stack.
+                 * If the fault is exactly one page below stack_base, it's a
+                 * stack overflow — don't resolve, let it panic. */
+            }
+        }
 
-                uint64_t *pd = pt_phys_to_virt(pte_addr(pdpe));
-                uint64_t pde = pd[PD_INDEX(cr2)];
+        if (valid_demand) {
+            uint64_t cr3_val;
+            asm volatile ("mov %%cr3, %0" : "=r"(cr3_val));
+            uint64_t *pml4 = pt_phys_to_virt(cr3_val);
 
-                if (pde & PTE_PRESENT) {
-                    if (pde & PTE_PS) goto fault_halt;
+            uint64_t pml4e = pml4[PML4_INDEX(cr2_page)];
+            if (pml4e & PTE_PRESENT) {
+                uint64_t *pdpt = pt_phys_to_virt(pte_addr(pml4e));
+                uint64_t pdpe = pdpt[PDPT_INDEX(cr2_page)];
 
-                    uint64_t *pt = pt_phys_to_virt(pte_addr(pde));
-                    uint64_t *pte_ptr = &pt[PT_INDEX(cr2)];
-                    uint64_t old_pte = *pte_ptr;
+                if (pdpe & PTE_PRESENT) {
+                    if (pdpe & PTE_PS) goto fault_halt;
 
-                    if (old_pte & PTE_DEMAND) {
-                        /* Allocate a physical frame. */
-                        uint64_t new_frame = pmm_alloc_frame();
-                        if (new_frame == 0) {
-                            serial_write_string(&g_serial,
-                                "DEMAND: OOM — cannot allocate frame\r\n");
-                            goto fault_halt;
+                    uint64_t *pd = pt_phys_to_virt(pte_addr(pdpe));
+                    uint64_t pde = pd[PD_INDEX(cr2_page)];
+
+                    if (pde & PTE_PRESENT) {
+                        if (pde & PTE_PS) goto fault_halt;
+
+                        uint64_t *pt = pt_phys_to_virt(pte_addr(pde));
+                        uint64_t *pte_ptr = &pt[PT_INDEX(cr2_page)];
+                        uint64_t old_pte = *pte_ptr;
+
+                        if (old_pte & PTE_DEMAND) {
+                            /* Allocate a physical frame. */
+                            uint64_t new_frame = pmm_alloc_frame();
+                            if (new_frame == 0) {
+                                serial_write_string(&g_serial,
+                                    "DEMAND: OOM — cannot allocate frame\r\n");
+                                goto fault_halt;
+                            }
+
+                            /* Zero the new frame — prevents information leaks. */
+                            void *new_virt = pt_phys_to_virt(new_frame);
+                            memset(new_virt, 0, PAGE_SIZE);
+
+                            /* Install mapping: keep original flags, clear DEMAND. */
+                            uint64_t new_flags = (old_pte & ~(PTE_DEMAND | PTE_ADDR_MASK))
+                                               | PTE_PRESENT;
+                            *pte_ptr = pte_make(new_frame, new_flags);
+
+                            pt_invlpg((void *)cr2);
+                            g_pf_depth--;
+                            return;
                         }
-
-                        /* Zero the new frame — prevents information leaks. */
-                        void *new_virt = pt_phys_to_virt(new_frame);
-                        memset(new_virt, 0, PAGE_SIZE);
-
-                        /* Install mapping: keep flags, clear DEMAND. */
-                        uint64_t new_flags = (old_pte & ~(PTE_DEMAND | PTE_ADDR_MASK))
-                                           | PTE_PRESENT | PTE_WRITABLE;
-                        *pte_ptr = pte_make(new_frame, new_flags);
-
-                        pt_invlpg((void *)cr2);
-                        g_pf_depth--;
-                        return;
                     }
                 }
             }
@@ -200,22 +241,21 @@ static void handler_pf(interrupt_frame_t *frame) {
     }
 
     /* --- Attempt COW resolution --- */
-    if ((frame->error_code & 2) && va_is_user(cr2) &&
-        is_page_aligned(cr2)) {
+    if ((frame->error_code & 2) && va_is_user(cr2_page)) {
         uint64_t cr3_val;
         asm volatile ("mov %%cr3, %0" : "=r"(cr3_val));
         uint64_t *pml4 = pt_phys_to_virt(cr3_val);
 
-        uint64_t pml4e = pml4[PML4_INDEX(cr2)];
+        uint64_t pml4e = pml4[PML4_INDEX(cr2_page)];
         if (pml4e & PTE_PRESENT) {
             uint64_t *pdpt = pt_phys_to_virt(pte_addr(pml4e));
-            uint64_t pdpe = pdpt[PDPT_INDEX(cr2)];
+            uint64_t pdpe = pdpt[PDPT_INDEX(cr2_page)];
             if ((pdpe & PTE_PRESENT) && !(pdpe & PTE_PS)) {
                 uint64_t *pd = pt_phys_to_virt(pte_addr(pdpe));
-                uint64_t pde = pd[PD_INDEX(cr2)];
+                uint64_t pde = pd[PD_INDEX(cr2_page)];
                 if ((pde & PTE_PRESENT) && !(pde & PTE_PS)) {
                     uint64_t *pt = pt_phys_to_virt(pte_addr(pde));
-                    uint64_t *pte_ptr = &pt[PT_INDEX(cr2)];
+                    uint64_t *pte_ptr = &pt[PT_INDEX(cr2_page)];
                     uint64_t old_pte = *pte_ptr;
 
                     if (old_pte & PTE_COW) {
@@ -364,6 +404,14 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     timer_init(&g_serial);
     serial_write_string(&g_serial, "[INFO] Timer initialized (PIT + IRQ 0).\r\n");
 
+    /* --- 14b. SYSCALL/SYSRET init (programs MSRs for fast user->kernel). */
+    syscall_init(&g_serial);
+    serial_write_string(&g_serial, "[INFO] SYSCALL/SYSRET initialized.\r\n");
+
+    /* --- 14c. ELF loader init. */
+    elf_init(&g_serial);
+    serial_write_string(&g_serial, "[INFO] ELF loader initialized.\r\n");
+
     /* --- 15. Tests --- */
     test_register_serial();
     test_register_boot();
@@ -383,6 +431,10 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     test_register_spinlock_rflags();
     test_register_mlfq();
     test_register_zombie();
+    test_register_syscall();
+    test_register_validation();
+    test_register_usermode();
+    test_register_elf();
     test_run_all(&g_serial);
 
     /* --- Post-tests: enable interrupts and enter the scheduler idle loop.

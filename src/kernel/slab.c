@@ -177,11 +177,12 @@ void *slab_alloc(uint64_t size)
 
     int class_idx = size_to_class(size);
 
-    /* Fall back to kmalloc for allocations larger than the biggest slab class. */
+    /* Fall back to kmalloc for allocations larger than the biggest slab class.
+     * Note: these allocations are not tracked in g_slab_allocated_bytes
+     * because slab_free cannot determine the original size on deallocation.
+     * Use kheap stats for large-object accounting. */
     if (class_idx < 0) {
-        void *ptr = kmalloc(size);
-        if (ptr) g_slab_allocated_bytes += size;
-        return ptr;
+        return kmalloc(size);
     }
 
     uint64_t slab_rflags = spin_lock(&g_slab_lock);

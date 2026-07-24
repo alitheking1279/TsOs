@@ -389,12 +389,14 @@ void pt_cleanup_empty_tables(uint64_t *pml4, uint64_t vaddr) {
 
     pmm_free_frame(pte_addr(pde));
     pd[pd_idx] = 0;
+    pt_flush_tlb();  /* Flush TLB after freeing intermediate table. */
 
     /* Level 2: check if PD is now empty → free it, clear PDPT entry. */
     if (!pt_table_empty(pd)) return;
 
     pmm_free_frame(pte_addr(pdpe));
     pdpt[pdpt_idx] = 0;
+    pt_flush_tlb();
 
     /* Level 3: check if PDPT is now empty → free it, clear PML4 entry.
      * Only allowed for user-space PML4 entries (1-255). */
@@ -403,6 +405,7 @@ void pt_cleanup_empty_tables(uint64_t *pml4, uint64_t vaddr) {
 
     pmm_free_frame(pte_addr(pml4e));
     pml4[pml4_idx] = 0;
+    pt_flush_tlb();
 }
 
 /* =========================================================================

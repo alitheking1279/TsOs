@@ -92,6 +92,26 @@ uint64_t scheduler_get_task_count(void);
  */
 void idle_task_entry(void);
 
+/**
+ * @brief Unblock a sleeping task and re-enqueue it in the scheduler.
+ *
+ * Transitions the task from BLOCKED to READY and adds it to the
+ * MLFQ ready queue at level 0.
+ *
+ * @param task  Task to wake (must be in BLOCKED state).
+ */
+void scheduler_wake_task(task_t *task);
+
+/**
+ * @brief Remove a task from the scheduler without changing its state.
+ *
+ * Used by task_wait to block a task: removes it from the MLFQ
+ * ready queue so it is no longer scheduled.
+ *
+ * @param task  Task to remove from the ready queue.
+ */
+void scheduler_unqueue_task(task_t *task);
+
 #ifdef __cplusplus
 }
 #endif

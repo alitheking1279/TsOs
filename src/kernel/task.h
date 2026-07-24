@@ -48,8 +48,47 @@ extern "C" {
 /** Virtual address base for user stacks (in lower-half user space). */
 #define TASK_USER_STACK_BASE     0x0000004000000000ULL
 
+/** Default user heap base address (set by execve after loading ELF). */
+#define TASK_USER_HEAP_BASE      0x0000000080000000ULL
+
 /** Invalid PID (sentinel). */
 #define TASK_INVALID_PID         0
+
+/** Maximum number of open file descriptors per task. */
+#define TASK_MAX_FDS             64
+
+/** Maximum number of mmap regions per task. */
+#define TASK_MAX_MMAPS           16
+
+/* =========================================================================
+ * File Operations (minimal VFS interface)
+ * ========================================================================= */
+
+/** File operations vtable — one per open file. */
+typedef struct file_ops {
+    int64_t (*read)(int fd, void *buf, uint64_t count, void *data);
+    int64_t (*write)(int fd, const void *buf, uint64_t count, void *data);
+    void    (*close)(int fd, void *data);
+} file_ops_t;
+
+/** Open file descriptor entry. */
+typedef struct file {
+    file_ops_t *ops;
+    void       *data;
+    int         refcount;
+    uint32_t    flags;
+} file_t;
+
+/* =========================================================================
+ * Memory Map Region Tracking
+ * ========================================================================= */
+
+/** Describes a mmap'd region. */
+typedef struct mmap_region {
+    uint64_t base;
+    uint64_t size;
+    uint64_t prot;
+} mmap_region_t;
 
 /* =========================================================================
  * Task States
@@ -99,12 +138,27 @@ typedef struct task {
     uint64_t        kernel_stack_size;  /**< Size of kernel stack. */
     uint64_t        user_stack_base;    /**< Base address of user stack. */
     uint64_t        user_stack_size;    /**< Size of user stack. */
+    uint64_t        user_heap_start;    /**< Base of user heap (set by execve). */
+    uint64_t        user_heap_brk;      /**< Current heap break (grows on brk). */
 
-    /* ---- FPU state (for future ring-3 support) ---- */
+    /* ---- FPU state (saved/restored by context_switch on kernel stack) ---- */
     uint8_t         *fpu_state;     /**< Aligned 512-byte FXSAVE area, or NULL for kernel tasks. */
 
     /* ---- Scheduler linkage ---- */
     struct task     *next;          /**< Next task in the ready/sleep queue. */
+
+    /* ---- Global task list ---- */
+    struct task     *g_next;        /**< Next task in the global task list. */
+
+    /* ---- Blocking ---- */
+    bool            is_waiting_for_children; /**< True if blocked in task_wait. */
+
+    /* ---- File descriptor table ---- */
+    file_t          fd_table[TASK_MAX_FDS];
+
+    /* ---- Memory map tracking ---- */
+    mmap_region_t   mmap_regions[TASK_MAX_MMAPS];
+    int             mmap_count;
 
     /* ---- Metadata ---- */
     const char      *name;          /**< Human-readable task name (for debugging). */
@@ -137,6 +191,20 @@ void task_init(void *serial_dev);
  * @return Pointer to the new task, or NULL on allocation failure.
  */
 task_t *task_create(const char *name, void (*entry)(void), bool is_kernel);
+
+/**
+ * @brief Create a user-mode task from an ELF64 executable.
+ *
+ * Allocates a PCB, address space, kernel stack, and loads the ELF
+ * segments into the address space.  The user stack and heap are
+ * demand-paged.
+ *
+ * @param name      Human-readable name.
+ * @param elf_data  Pointer to the ELF file data (must remain valid).
+ * @param elf_size  Size of the ELF data in bytes.
+ * @return Pointer to the new task, or NULL on failure.
+ */
+task_t *task_create_elf(const char *name, const void *elf_data, size_t elf_size);
 
 /**
  * @brief Create the idle task (called by scheduler_init).
@@ -222,6 +290,23 @@ int task_wait(int *status);
  * @param task  Task whose children to reparent.
  */
 void task_reparent_children(task_t *task);
+
+/**
+ * @brief Wake a blocked task — make it ready and re-enqueue in the scheduler.
+ *
+ * Called by task_exit when a child exits and the parent is waiting.
+ *
+ * @param task  Task to wake (must be in TASK_STATE_BLOCKED).
+ */
+void task_wake(task_t *task);
+
+/**
+ * @brief Find a task by PID using the global task list.
+ *
+ * @param pid  Process ID to find.
+ * @return Pointer to the task, or NULL if not found.
+ */
+task_t *task_find_by_pid(uint64_t pid);
 
 #ifdef __cplusplus
 }

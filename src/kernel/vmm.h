@@ -113,13 +113,11 @@ void vmm_init(void *serial_dev);
 vmm_status_t vmm_create_address_space(address_space_t *out);
 
 /**
- * @brief Destroy an address space and free all its page table pages.
+ * @brief Destroy an address space and free all its resources.
  *
- * Frees every intermediate page table page in the address space back
- * to the PMM.  Physical frames mapped in the user half are NOT freed
- * (the caller is responsible for managing those).
- *
- * The kernel address space cannot be destroyed.
+ * Frees every intermediate page table page AND every physical frame
+ * mapped in the user half back to the PMM.  The kernel address space
+ * cannot be destroyed.
  *
  * @param as  Address space to destroy.
  * @return VMM_OK on success, VMM_ERR_INVALID if NULL or kernel space.
@@ -234,6 +232,24 @@ bool vmm_is_initialized(void);
  * @return VMM_OK on success, VMM_ERR_NOT_MAPPED if not mapped.
  */
 vmm_status_t vmm_unmap_and_free(address_space_t *as, uint64_t vaddr);
+
+/**
+ * @brief Map a virtual address with a DEMAND PTE (lazy allocation).
+ *
+ * Creates a page table entry that is NOT present but has PTE_DEMAND
+ * set.  When the page is first accessed, the page fault handler
+ * allocates a physical frame and resolves the mapping automatically.
+ *
+ * Used for user stacks and heap — avoids allocating physical memory
+ * for pages that may never be touched.
+ *
+ * @param as     Target address space.
+ * @param vaddr  Virtual address (must be page-aligned, user half).
+ * @param flags  PTE flags (without PTE_PRESENT — e.g. VMM_FLAG_WRITE | VMM_FLAG_USER).
+ * @return VMM_OK on success, or an error code.
+ */
+vmm_status_t vmm_map_demand_page(address_space_t *as, uint64_t vaddr,
+                                 uint64_t flags);
 
 #ifdef __cplusplus
 }

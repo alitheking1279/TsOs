@@ -108,6 +108,19 @@ uint64_t timer_get_ticks(void) {
 }
 
 void timer_wait_ticks(uint64_t ticks) {
+    /* Verify interrupts are enabled — hlt will deadlock if IF=0. */
+    uint64_t rflags;
+    asm volatile ("pushfq; pop %0" : "=r"(rflags));
+    if (!(rflags & 0x200)) {
+        timer_log("[TIMER] WARN: timer_wait_ticks called with interrupts disabled!\r\n");
+        /* Fall back to busy-wait instead of deadlocking. */
+        uint64_t target = g_ticks + ticks;
+        while (g_ticks < target) {
+            asm volatile ("pause");
+        }
+        return;
+    }
+
     uint64_t target = g_ticks + ticks;
     while (g_ticks < target) {
         asm volatile ("hlt");  /* Save power until next interrupt. */
