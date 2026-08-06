@@ -354,8 +354,10 @@ void pt_free_recursive(uint64_t *table, int level) {
  * to locate the intermediate tables for `vaddr`, then walks back up
  * freeing any that are empty and clearing the parent entry.
  *
-     * Safety: PML4 entries 0 and 256-511 (kernel half) are never
-     * cleared — only user-space entries (1-255) may be freed.
+     * Safety: PML4 entries 256-511 (kernel half) are never cleared —
+     * only user-space entries (0-255) may be freed.  Note PML4[0] is
+     * user space (the lowest 512 GiB), so it is eligible like any other
+     * user PML4 entry.
  *
  * @param pml4   PML4 table pointer (kernel-virtual).
  * @param vaddr  Virtual address whose intermediate tables to check.
@@ -399,9 +401,10 @@ void pt_cleanup_empty_tables(uint64_t *pml4, uint64_t vaddr) {
     pt_flush_tlb();
 
     /* Level 3: check if PDPT is now empty → free it, clear PML4 entry.
-     * Only allowed for user-space PML4 entries (1-255). */
+     * Only allowed for user-space PML4 entries (0-255).  The kernel half
+     * (256-511) holds shared kernel mappings and is never cleared. */
     if (!pt_table_empty(pdpt)) return;
-    if (pml4_idx == 0 || pml4_idx >= 256) return;
+    if (pml4_idx >= 256) return;
 
     pmm_free_frame(pte_addr(pml4e));
     pml4[pml4_idx] = 0;

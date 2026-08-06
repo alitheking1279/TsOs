@@ -78,26 +78,28 @@ extern void user_task_iretq_trampoline(void);
  *     [+48] entry address   <- ret pops this into RIP after 6 pops
  *
  * For user tasks:
- *   Creates an IRETQ frame at the bottom of the kernel stack, then
- *   a context_switch frame above it.  context_switch "returns" to
- *   user_task_iretq_trampoline, which executes IRETQ to ring 3.
+ *   Creates an IRETQ frame on the kernel stack, then a context_switch
+ *   frame below it.  context_switch pops 6 registers and returns to
+ *   user_task_iretq_trampoline, which executes IRETQ to ring 3.  When
+ *   the trampoline runs, RSP points at the IRETQ frame bottom (RIP).
  *
- *   Kernel stack layout (low address -> high address):
- *     IRETQ frame (built from bottom):
- *       [+0]  RIP  = entry (0x400000)
- *       [+8]  CS   = GDT_USER_CS_SEL (0x1B)
- *       [+16] RFLAGS = 0x202 (IF enabled)
- *       [+24] RSP  = user stack top
- *       [+32] SS   = GDT_USER_DS_SEL (0x23)
- *     Context_switch frame (built above IRETQ):
- *       [+40] rbx  = 0
- *       [+48] rbp  = 0
- *       [+56] r12  = 0
- *       [+64] r13  = 0
- *       [+72] r14  = 0
- *       [+80] r15  = 0
- *       [+88] ret addr = user_task_iretq_trampoline
- *     kernel_rsp -> [+40]
+ *   Kernel stack layout (kernel_rsp -> high address):
+ *     [+0]  rbx = 0                 <- kernel_rsp
+ *     [+8]  rbp = 0
+ *     [+16] r12 = 0
+ *     [+24] r13 = 0
+ *     [+32] r14 = 0
+ *     [+40] r15 = 0
+ *     [+48] ret addr = user_task_iretq_trampoline
+ *     [+56] RIP  = entry (0x400000)
+ *     [+64] CS   = GDT_USER_CS_SEL (0x23)
+ *     [+72] RFLAGS = 0x202 (IF enabled)
+ *     [+80] RSP  = user stack top
+ *     [+88] SS   = GDT_USER_DS_SEL (0x1B)
+ *
+ *   Because the stack grows down, the IRETQ qwords are pushed in
+ *   reverse order (SS first, then RSP, RFLAGS, CS, RIP) so that RIP
+ *   ends up at the lowest address of the frame.
  */
 static void setup_initial_stack(task_t *task, void (*entry)(void)) {
     /* Start from the top of the kernel stack, aligned to 16 bytes. */
@@ -118,18 +120,18 @@ static void setup_initial_stack(task_t *task, void (*entry)(void)) {
 
         task->kernel_rsp = (uint64_t)sp;
     } else {
-        /* User task: build IRETQ frame at bottom, context_switch frame above. */
+        /* User task: IRETQ frame on top, context_switch frame below. */
         uint64_t user_stack_top = task->user_stack_base + task->user_stack_size;
 
-        /* --- IRETQ frame (5 qwords, at the bottom of the kernel stack) --- */
+        /* --- IRETQ frame (5 qwords; pushed so RIP is at the lowest addr) --- */
         uint64_t *sp = (uint64_t *)stack_top;
-        sp--; *sp = (uint64_t)entry;          /* RIP = user entry */
-        sp--; *sp = GDT_USER_CS_SEL;          /* CS  = 0x1B */
-        sp--; *sp = 0x202;                     /* RFLAGS (IF=1) */
+        sp--; *sp = GDT_USER_DS_SEL;          /* SS  = 0x1B */
         sp--; *sp = user_stack_top;            /* RSP = user stack top */
-        sp--; *sp = GDT_USER_DS_SEL;          /* SS  = 0x23 */
+        sp--; *sp = 0x202;                     /* RFLAGS (IF=1) */
+        sp--; *sp = GDT_USER_CS_SEL;          /* CS  = 0x23 */
+        sp--; *sp = (uint64_t)entry;          /* RIP = user entry */
 
-        /* --- Context_switch frame (above IRETQ, returns to trampoline) --- */
+        /* --- Context_switch frame (below IRETQ, returns to trampoline) --- */
         sp--; *sp = (uint64_t)&user_task_iretq_trampoline;  /* ret target */
         sp--; *sp = 0;                /* r15 */
         sp--; *sp = 0;                /* r14 */
@@ -430,6 +432,11 @@ task_t *task_find_by_pid(uint64_t pid) {
     }
     return NULL;
 }
+
+task_t *task_get_list_head(void) {
+    return g_task_list;
+}
+
 
 /* =========================================================================
  * Sleep / Wake

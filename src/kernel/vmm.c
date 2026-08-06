@@ -190,11 +190,12 @@ vmm_status_t vmm_create_address_space(address_space_t *out) {
     /* Zero the entire PML4. */
     memset(pml4, 0, PAGE_SIZE);
 
-    /* Copy entry 0 from the kernel PML4.  This was the identity map
-     * before it was removed; it is now 0 in the kernel address space.
-     * We copy it anyway so that any future PML4[0] user mappings in
-     * the kernel are reflected in new address spaces. */
-    pml4[0] = g_kernel_aspace.pml4[0];
+    /* Zero the entire PML4 (done above) — the user half (entries 0-255)
+     * starts empty and is populated only by user mappings, which install
+     * the USER bit on every level of the walk.  We deliberately do NOT
+     * copy kernel PML4[0] here: that entry is user space (the lowest
+     * 512 GiB), and copying it can inherit a supervisor-only or dangling
+     * entry that makes every user access to the low half fault. */
 
     /* Copy upper 256 entries (kernel half) from the kernel PML4.
      * This ensures the kernel is mapped in every address space. */
@@ -321,12 +322,15 @@ vmm_status_t vmm_map_page(address_space_t *as, uint64_t vaddr,
     if (st != VMM_OK) return st;
 
     /* Ensure PRESENT is always set on the leaf.  Intermediate entries
-     * use PT_DEFAULT_FLAGS (PRESENT | WRITABLE) for the walk. */
+     * use PT_DEFAULT_FLAGS (PRESENT | WRITABLE) plus the USER bit when
+     * the leaf is a user mapping — user access requires USER=1 on every
+     * level of the walk, not just the PTE. */
     uint64_t leaf_flags = flags | PTE_PRESENT;
+    uint64_t inter_flags = PT_DEFAULT_FLAGS | (flags & PTE_USER);
 
     /* Walk to the leaf PTE, allocating intermediate tables. */
     uint64_t *pte = pt_walk_to_leaf(as->pml4, vaddr, true,
-                                     PT_DEFAULT_FLAGS);
+                                     inter_flags);
     if (!pte) {
         VMM_LOG_ERR("MAP: walk failed for vaddr ");
         vmm_log_hex64(vaddr);
@@ -355,6 +359,85 @@ vmm_status_t vmm_map_page(address_space_t *as, uint64_t vaddr,
     char fbuf[8];
     format_flags(leaf_flags, fbuf, sizeof(fbuf));
     VMM_LOG_INF("MAP: vaddr ");
+    vmm_log_hex64(vaddr);
+    VMM_LOG_INF(" -> paddr ");
+    vmm_log_hex64(paddr);
+    VMM_LOG_INF(" [");
+    vmm_log_write(1, fbuf);
+    VMM_LOG_INF("]\r\n");
+
+    return VMM_OK;
+}
+
+vmm_status_t vmm_map_page_merge(address_space_t *as, uint64_t vaddr,
+                                uint64_t paddr, uint64_t flags) {
+    if (!g_vmm_initialized) return VMM_ERR_NOT_INIT;
+
+    vmm_status_t st;
+
+    /* Validate inputs. */
+    st = validate_aspace(as);
+    if (st != VMM_OK) return st;
+
+    st = validate_vaddr(vaddr);
+    if (st != VMM_OK) return st;
+
+    st = validate_paddr(paddr);
+    if (st != VMM_OK) return st;
+
+    /* Ensure PRESENT is always set on the leaf.  Intermediate entries
+     * use PT_DEFAULT_FLAGS (PRESENT | WRITABLE) plus the USER bit when
+     * the leaf is a user mapping — user access requires USER=1 on every
+     * level of the walk, not just the PTE. */
+    uint64_t leaf_flags = flags | PTE_PRESENT;
+    uint64_t inter_flags = PT_DEFAULT_FLAGS | (flags & PTE_USER);
+
+    /* Walk to the leaf PTE, allocating intermediate tables. */
+    uint64_t *pte = pt_walk_to_leaf(as->pml4, vaddr, true,
+                                     inter_flags);
+    if (!pte) {
+        VMM_LOG_ERR("MAPM: walk failed for vaddr ");
+        vmm_log_hex64(vaddr);
+        VMM_LOG_ERR("\r\n");
+        return VMM_ERR_NO_MEM;
+    }
+
+    /* Existing mapping: upgrade permissions in place (keep the paddr
+     * already installed; flag bits are OR'd together).  This is what
+     * allows ELF PT_LOAD segments that share a page (e.g. a read-exec
+     * text page tail also covered by a read-write data segment) to
+     * map cleanly without failing.  NX is dropped whenever either
+     * segment allows execution. */
+    if (*pte & PTE_PRESENT) {
+        uint64_t merged_flags = (*pte | leaf_flags);
+        if (!(leaf_flags & PTE_NX)) merged_flags &= ~PTE_NX;
+        uint64_t merged = (*pte & PTE_ADDR_MASK) | merged_flags;
+        if (merged != *pte) {
+            *pte = merged;
+            pt_invlpg((void *)vaddr);
+
+            char fbuf[8];
+            format_flags(merged_flags, fbuf, sizeof(fbuf));
+            VMM_LOG_INF("MAPM: vaddr ");
+            vmm_log_hex64(vaddr);
+            VMM_LOG_INF(" flags upgraded [");
+            vmm_log_write(1, fbuf);
+            VMM_LOG_INF("]\r\n");
+        }
+        return VMM_OK;
+    }
+
+    /* Fresh mapping: install the leaf PTE. */
+    uint64_t new_pte = pte_make(paddr, leaf_flags);
+    *pte = new_pte;
+
+    /* Flush TLB for this address. */
+    pt_invlpg((void *)vaddr);
+
+    /* Log the mapping. */
+    char fbuf[8];
+    format_flags(leaf_flags, fbuf, sizeof(fbuf));
+    VMM_LOG_INF("MAPM: vaddr ");
     vmm_log_hex64(vaddr);
     VMM_LOG_INF(" -> paddr ");
     vmm_log_hex64(paddr);
@@ -401,7 +484,7 @@ vmm_status_t vmm_unmap_page(address_space_t *as, uint64_t vaddr) {
     VMM_LOG_INF(")\r\n");
 
     /* Free intermediate page tables that became empty after this unmap.
-     * Only user-space entries (PML4 index 1-255) may be freed.
+     * Only user-space entries (PML4 index 0-255) may be freed.
      * Note: demand PTEs (no physical frame) do NOT call pmm_free_frame. */
     pt_cleanup_empty_tables(as->pml4, vaddr);
 
@@ -737,9 +820,12 @@ vmm_status_t vmm_map_demand_page(address_space_t *as, uint64_t vaddr,
     if (st != VMM_OK) return st;
 
     /* Walk to the leaf PTE, creating intermediate tables as needed.
-     * Intermediate entries use PRESENT | WRITABLE (same as vmm_map_page). */
+     * Intermediate entries use PRESENT | WRITABLE (same as vmm_map_page)
+     * plus the USER bit when the leaf is a user mapping — user access
+     * requires USER=1 on every level of the walk. */
+    uint64_t inter_flags = PT_DEFAULT_FLAGS | (flags & PTE_USER);
     uint64_t *pte = pt_walk_to_leaf(as->pml4, vaddr, true,
-                                     PT_DEFAULT_FLAGS);
+                                     inter_flags);
     if (!pte) {
         VMM_LOG_ERR("DEMAND: walk failed for vaddr ");
         vmm_log_hex64(vaddr);

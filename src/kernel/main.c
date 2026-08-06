@@ -48,6 +48,11 @@
 #include "elf.h"
 #include "../drivers/serial.h"
 #include "../drivers/ata.h"
+#include "../drivers/ps2.h"
+#include "../drivers/vga.h"
+#include "../drivers/pcspk.h"
+#include "../drivers/pci.h"
+#include "../drivers/ac97.h"
 #include "../fs/block_dev.h"
 #include "../fs/bcache.h"
 #include "../fs/vfs.h"
@@ -62,7 +67,7 @@ uint32_t boot_magic    = 0;
 uint32_t boot_info_ptr = 0;
 
 /* ---- serial device shared with fault handlers ---- */
-static serial_dev_t g_serial;
+serial_dev_t g_serial;
 
 /* ---- test suite registration functions ---- */
 extern void test_register_serial(void);
@@ -100,6 +105,12 @@ extern void test_register_ext2_path(void);
 extern void test_register_ext2_syscall(void);
 extern void test_register_ext2_phase9(void);
 extern void test_register_vfs(void);
+extern void test_register_ps2(void);
+extern void test_register_vga(void);
+extern void test_register_pcspk(void);
+extern void test_register_pci(void);
+extern void test_register_ac97(void);
+extern void test_register_console(void);
 
 /* =========================================================================
  * Fault handlers — diagnostic dumps for PMM-critical exceptions
@@ -170,6 +181,19 @@ static void handler_pf(interrupt_frame_t *frame) {
 
     uint64_t cr2;
     asm volatile ("mov %%cr2, %0" : "=r"(cr2));
+
+    /* TEMP-DIAG: log every #PF including resolved ones. */
+    serial_write_string(&g_serial, "[PF] cr2=");
+    print_hex64(&g_serial, cr2);
+    serial_write_string(&g_serial, " err=");
+    print_hex64(&g_serial, frame->error_code);
+    serial_write_string(&g_serial, " rip=");
+    print_hex64(&g_serial, frame->rip);
+    serial_write_string(&g_serial, " cs=");
+    print_hex64(&g_serial, frame->cs);
+    serial_write_string(&g_serial, " rsp=");
+    print_hex64(&g_serial, frame->rsp);
+    serial_write_string(&g_serial, "\r\n");
 
     /* Align CR2 down to page boundary for demand/COW resolution.
      * The faulting address may be any byte within the page — the
@@ -304,7 +328,76 @@ static void handler_pf(interrupt_frame_t *frame) {
 
 fault_halt:
     {
+        /* Diagnostic: dump the active CR3 and the raw page walk for CR2. */
+        uint64_t cr3_dbg;
+        asm volatile ("mov %%cr3, %0" : "=r"(cr3_dbg));
+        serial_write_string(&g_serial, "PF-DIAG: CR3=");
+        print_hex64(&g_serial, cr3_dbg);
+        serial_write_string(&g_serial, " CR2=");
+        print_hex64(&g_serial, cr2);
+        serial_write_string(&g_serial, " ERR=");
+        print_hex64(&g_serial, frame->error_code);
+        serial_write_string(&g_serial, "\r\n");
+        {
+            uint64_t *pml4 = pt_phys_to_virt(cr3_dbg);
+            uint64_t e1 = pml4[PML4_INDEX(cr2_page)];
+            serial_write_string(&g_serial, "PF-DIAG: PML4[");
+            print_hex64(&g_serial, PML4_INDEX(cr2_page));
+            serial_write_string(&g_serial, "]=");
+            print_hex64(&g_serial, e1);
+            serial_write_string(&g_serial, "\r\n");
+            if (e1 & PTE_PRESENT) {
+                uint64_t *pdpt = pt_phys_to_virt(pte_addr(e1));
+                uint64_t e2 = pdpt[PDPT_INDEX(cr2_page)];
+                serial_write_string(&g_serial, "PF-DIAG: PDPT[");
+                print_hex64(&g_serial, PDPT_INDEX(cr2_page));
+                serial_write_string(&g_serial, "]=");
+                print_hex64(&g_serial, e2);
+                serial_write_string(&g_serial, "\r\n");
+                if (e2 & PTE_PRESENT) {
+                    uint64_t *pd = pt_phys_to_virt(pte_addr(e2));
+                    uint64_t e3 = pd[PD_INDEX(cr2_page)];
+                    serial_write_string(&g_serial, "PF-DIAG: PD[");
+                    print_hex64(&g_serial, PD_INDEX(cr2_page));
+                    serial_write_string(&g_serial, "]=");
+                    print_hex64(&g_serial, e3);
+                    serial_write_string(&g_serial, "\r\n");
+                    if (e3 & PTE_PRESENT) {
+                        uint64_t *pt = pt_phys_to_virt(pte_addr(e3));
+                        uint64_t e4 = pt[PT_INDEX(cr2_page)];
+                        serial_write_string(&g_serial, "PF-DIAG: PT[");
+                        print_hex64(&g_serial, PT_INDEX(cr2_page));
+                        serial_write_string(&g_serial, "]=");
+                        print_hex64(&g_serial, e4);
+                        serial_write_string(&g_serial, "\r\n");
+                    }
+                }
+            }
+        }
+
         g_pf_depth--;  /* Reset depth before panic to avoid stale recursion detection */
+        {
+            serial_write_string(&g_serial, "PF-DIAG: RIP-BYTES @");
+            print_hex64(&g_serial, frame->rip);
+            serial_write_string(&g_serial, ":");
+            volatile uint8_t *insn = (volatile uint8_t *)frame->rip;
+            for (int i = 0; i < 16; i++) {
+                serial_write_string(&g_serial, " ");
+                print_hex64(&g_serial, (uint64_t)insn[i]);
+            }
+            serial_write_string(&g_serial, "\r\n");
+        }
+        {
+            serial_write_string(&g_serial, "PF-DIAG: RAW-FRAME:\r\n");
+            uint64_t *frw = (uint64_t *)frame;
+            for (int i = 0; i < 22; i++) {
+                serial_write_string(&g_serial, "  [");
+                print_hex64(&g_serial, (uint64_t)(i * 8));
+                serial_write_string(&g_serial, "]=");
+                print_hex64(&g_serial, frw[i]);
+                serial_write_string(&g_serial, "\r\n");
+            }
+        }
         panic_regs_t pr;
         fill_panic_regs(&pr, frame, cr2);
         kernel_panic("#PF — Page Fault", &pr);
@@ -315,6 +408,17 @@ fault_halt:
 static void register_fault_handlers(void) {
     isr_register_handler(13, handler_gp);
     isr_register_handler(14, handler_pf);
+}
+
+/* ---- ATA → block device bridge wrappers ---- */
+static block_status_t ata_bd_read(uint8_t dev_id, uint32_t lba, void *buf) {
+    (void)dev_id;
+    return (ata_read_sector(lba, 1, buf) == ATA_OK) ? BLOCK_OK : BLOCK_ERR_IO;
+}
+
+static block_status_t ata_bd_write(uint8_t dev_id, uint32_t lba, const void *buf) {
+    (void)dev_id;
+    return (ata_write_sector(lba, 1, buf) == ATA_OK) ? BLOCK_OK : BLOCK_ERR_IO;
 }
 
 /* =========================================================================
@@ -422,15 +526,33 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     timer_init(&g_serial);
     serial_write_string(&g_serial, "[INFO] Timer initialized (PIT + IRQ 0).\r\n");
 
-    /* --- 14b. SYSCALL/SYSRET init (programs MSRs for fast user->kernel). */
+    /* --- 14b. PS/2 Keyboard init. */
+    ps2_init(&g_serial);
+
+    /* --- 14b2. PC Speaker init. */
+    pcspk_init(&g_serial);
+    serial_write_string(&g_serial, "[INFO] PC Speaker initialized.\r\n");
+
+    /* --- 14b3. PCI bus scan. */
+    pci_init(&g_serial);
+    serial_write_string(&g_serial, "[INFO] PCI bus scanned.\r\n");
+
+    /* --- 14b4. AC97 audio init. */
+    ac97_init(&g_serial);
+
+    /* --- 14c. VGA text-mode init. */
+    vga_init();
+    serial_write_string(&g_serial, "[INFO] VGA text-mode initialized.\r\n");
+
+    /* --- 14d. SYSCALL/SYSRET init (programs MSRs for fast user->kernel). */
     syscall_init(&g_serial);
     serial_write_string(&g_serial, "[INFO] SYSCALL/SYSRET initialized.\r\n");
 
-    /* --- 14c. ELF loader init. */
+    /* --- 14e. ELF loader init. */
     elf_init(&g_serial);
     serial_write_string(&g_serial, "[INFO] ELF loader initialized.\r\n");
 
-    /* --- 14d. ATA PIO driver init. */
+    /* --- 14f. ATA PIO driver init. */
     ata_status_t ata_st = ata_init(&g_serial);
     if (ata_st == ATA_OK) {
         serial_write_string(&g_serial, "[INFO] ATA PIO driver initialized.\r\n");
@@ -440,20 +562,54 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
         serial_write_string(&g_serial, " (tests will use mock devices)\r\n");
     }
 
-    /* --- 14e. Block device layer init. */
+    /* --- 14g. Block device layer init. */
     block_dev_init(&g_serial);
     serial_write_string(&g_serial, "[INFO] Block device layer initialized.\r\n");
 
-    /* --- 14f. Buffer cache init. */
+    /* --- 14h. Buffer cache init. */
     bcache_init(&g_serial);
     serial_write_string(&g_serial, "[INFO] Buffer cache initialized.\r\n");
 
-    /* --- 14g. VFS init. */
+    /* --- 14i. VFS init. */
     vfs_init();
     vfs_register_fs(&ext2_vfs_ops);
     serial_write_string(&g_serial, "[INFO] VFS initialized, ext2 registered.\r\n");
 
-    /* --- 15. Tests --- */
+    /* --- 14j. ATA → block_dev bridge (wrap ATA PIO into block device interface). */
+    static uint8_t g_ata_block_dev_id = 0xFF;
+    if (ata_is_initialized()) {
+        block_device_t ata_block = {
+            .read_sector  = ata_bd_read,
+            .write_sector = ata_bd_write,
+            .sector_size  = ATA_SECTOR_SIZE,
+            .total_sectors = 8192,  /* 4 MiB = 8192 × 512-byte sectors */
+        };
+        block_status_t bd_st = block_dev_register(&ata_block, &g_ata_block_dev_id);
+        if (bd_st == BLOCK_OK) {
+            serial_write_string(&g_serial, "[INFO] ATA registered as block device ID=");
+            serial_write_string(&g_serial, (g_ata_block_dev_id == 0) ? "0" : "1");
+            serial_write_string(&g_serial, "\r\n");
+        } else {
+            serial_write_string(&g_serial, "[WARN] ATA block device registration failed.\r\n");
+        }
+    }
+
+    /* --- 14k. Mount ext2 root filesystem on ATA block device. */
+    ext2_init(&g_serial);
+    if (g_ata_block_dev_id != 0xFF) {
+        ext2_status_t e2_st = ext2_mount(g_ata_block_dev_id);
+        if (e2_st == EXT2_OK) {
+            serial_write_string(&g_serial, "[INFO] ext2 root filesystem mounted.\r\n");
+            /* Mount "/" via VFS so vfs_open/vfs_stat resolve paths. */
+            vfs_mount("/", &ext2_vfs_ops, NULL);
+            serial_write_string(&g_serial, "[INFO] VFS mount at '/' registered.\r\n");
+        } else {
+            serial_write_string(&g_serial, "[WARN] ext2 mount failed (disk may be unformatted).\r\n");
+        }
+    }
+
+    /* --- 15. Tests (optional — define TSOS_SKIP_TESTS to skip) --- */
+#ifndef TSOS_SKIP_TESTS
     test_register_serial();
     test_register_boot();
     test_register_gdt();
@@ -489,12 +645,74 @@ void kernel_main(uint32_t magic, uint32_t info_ptr) {
     test_register_ext2_syscall();
     test_register_ext2_phase9();
     test_register_vfs();
+    test_register_ps2();
+    test_register_vga();
+    test_register_pcspk();
+    test_register_pci();
+    test_register_ac97();
+    test_register_console();
     test_run_all(&g_serial);
+    serial_write_string(&g_serial, "[INFO] All tests passed.\r\n");
+
+    /* Re-initialise ext2 and VFS mount after tests.
+     * The block_dev tests call unregister_all() which removes the ATA
+     * block device, and the VFS/ext2 tests corrupt g_fs and the mount
+     * table.  We must re-register the ATA device and re-init everything. */
+    if (ata_is_initialized()) {
+        block_device_t ata_block = {
+            .read_sector  = ata_bd_read,
+            .write_sector = ata_bd_write,
+            .sector_size  = ATA_SECTOR_SIZE,
+            .total_sectors = 8192,
+        };
+        block_dev_register(&ata_block, &g_ata_block_dev_id);
+        serial_write_string(&g_serial, "[INFO] ATA re-registered as block device ID=");
+        serial_write_string(&g_serial, (g_ata_block_dev_id == 0) ? "0\r\n" : "?\r\n");
+
+        vfs_init();
+        vfs_register_fs(&ext2_vfs_ops);
+        ext2_init(&g_serial);
+        if (ext2_mount(g_ata_block_dev_id) == EXT2_OK) {
+            vfs_mount("/", &ext2_vfs_ops, NULL);
+            serial_write_string(&g_serial, "[INFO] VFS re-mounted after tests.\r\n");
+        } else {
+            serial_write_string(&g_serial, "[WARN] ext2 re-mount failed after tests.\r\n");
+        }
+    }
+#endif
+
+    /* --- 16. Launch kernel-mode shell task. */
+    /* TEMP: disabled while the ring-3 ushell (user_shell.elf) is under
+     * smoke test.  Re-enable if the user-ELF shell fails to boot. */
+#if 0
+    extern void shell_main(void);
+    task_t *shell_task = task_create("shell", shell_main, true);
+    if (shell_task) {
+        scheduler_add_task(shell_task);
+        serial_write_string(&g_serial, "[INFO] Shell task created (kernel-mode) and scheduled.\r\n");
+    } else {
+        serial_write_string(&g_serial, "[ERR] Failed to create shell task!\r\n");
+    }
+#endif
+
+    /* --- 17. Launch ring-3 user program (embedded user_shell.elf). */
+    extern const uint8_t _binary_user_shell_elf_start[];
+    extern const uint8_t _binary_user_shell_elf_end[];
+    uint64_t user_elf_size =
+        (uint64_t)(_binary_user_shell_elf_end - _binary_user_shell_elf_start);
+    task_t *user_task = task_create_elf("user", _binary_user_shell_elf_start,
+                                        user_elf_size);
+    if (user_task) {
+        scheduler_add_task(user_task);
+        serial_write_string(&g_serial, "[INFO] User ELF task created (ring 3) and scheduled.\r\n");
+    } else {
+        serial_write_string(&g_serial, "[ERR] Failed to create user ELF task!\r\n");
+    }
 
     /* --- Post-tests: enable interrupts and enter the scheduler idle loop.
      *         From here on, the timer fires at 100 Hz and the scheduler
      *         preempts tasks on quantum expiry. */
-    serial_write_string(&g_serial, "[INFO] All tests passed. Enabling interrupts.\r\n");
+    serial_write_string(&g_serial, "[INFO] Enabling interrupts.\r\n");
     asm volatile ("sti");
 
     /* Enter the idle loop — the scheduler will context-switch away

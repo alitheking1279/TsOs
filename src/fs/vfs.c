@@ -10,7 +10,10 @@
 #include "vfs.h"
 #include "../kernel/kheap.h"
 #include "../drivers/serial.h"
+#include "../lib/print.h"
 #include <string.h>
+
+extern serial_dev_t g_serial;
 
 /* =========================================================================
  * Global State
@@ -209,20 +212,41 @@ int vfs_rename(const char *old_path, const char *new_path) {
 }
 
 int vfs_mkdir(const char *path, uint32_t mode) {
+    serial_write_string(&g_serial, "[VFS] mkdir path="); serial_write_string(&g_serial, path); serial_write_string(&g_serial, "\r\n");
     const char *rel = NULL;
     vfs_mount_entry_t *mnt = NULL;
-    if (vfs_resolve_path(path, &rel, &mnt) < 0) return -1;
-    if (!mnt->ops || !mnt->ops->mkdir) return -1;
-    return mnt->ops->mkdir(rel, mode);
+    if (vfs_resolve_path(path, &rel, &mnt) < 0) {
+        serial_write_string(&g_serial, "[VFS] mkdir: resolve_path FAILED\r\n");
+        return -1;
+    }
+    serial_write_string(&g_serial, "[VFS] mkdir rel="); serial_write_string(&g_serial, rel); serial_write_string(&g_serial, "\r\n");
+    if (!mnt->ops || !mnt->ops->mkdir) {
+        serial_write_string(&g_serial, "[VFS] mkdir: no ops->mkdir\r\n");
+        return -1;
+    }
+    int ret = mnt->ops->mkdir(rel, mode);
+    serial_write_string(&g_serial, "[VFS] mkdir ret="); print_hex32(&g_serial, (uint32_t)ret); serial_write_string(&g_serial, "\r\n");
+    return ret;
 }
 
 int vfs_getdents(const char *path, uint64_t *cookie,
                  void *buf, uint32_t count) {
+    serial_write_string(&g_serial, "[VFS] getdents path="); serial_write_string(&g_serial, path); serial_write_string(&g_serial, " cookie=");
+    print_hex64(&g_serial, *cookie); serial_write_string(&g_serial, "\r\n");
     const char *rel = NULL;
     vfs_mount_entry_t *mnt = NULL;
-    if (vfs_resolve_path(path, &rel, &mnt) < 0) return -1;
-    if (!mnt->ops || !mnt->ops->getdents) return -1;
-    return mnt->ops->getdents(rel, cookie, buf, count);
+    if (vfs_resolve_path(path, &rel, &mnt) < 0) {
+        serial_write_string(&g_serial, "[VFS] getdents: resolve_path FAILED\r\n");
+        return -1;
+    }
+    serial_write_string(&g_serial, "[VFS] getdents rel="); serial_write_string(&g_serial, rel); serial_write_string(&g_serial, "\r\n");
+    if (!mnt->ops || !mnt->ops->getdents) {
+        serial_write_string(&g_serial, "[VFS] getdents: no ops->getdents\r\n");
+        return -1;
+    }
+    int ret = mnt->ops->getdents(rel, cookie, buf, count);
+    serial_write_string(&g_serial, "[VFS] getdents ret="); print_hex32(&g_serial, (uint32_t)ret); serial_write_string(&g_serial, "\r\n");
+    return ret;
 }
 
 vfs_fs_ops_t *vfs_get_ext2_ops(void) {

@@ -841,14 +841,15 @@ static void test_clone_table_copied(serial_dev_t *dev) {
     ASSERT_TRUE(dev, paddr != 0);
     vmm_map_page(&src, 0x0000008000000000, paddr, VMM_FLAG_WRITE);
 
-    /* Before clone: src has a PDPT entry at index 0, dst does not. */
-    ASSERT_TRUE(dev, src.pml4[0] != 0);
+    /* Before clone: src has a PDPT entry at index 1 (PML4_INDEX(0x8000000000) == 1),
+     * dst does not. */
+    ASSERT_TRUE(dev, src.pml4[1] != 0);
 
     vmm_clone_address_space(&src, &dst);
 
     /* After clone: both have PDPT entries, but they are different physical pages. */
-    uint64_t src_pdpt = pte_addr(src.pml4[0]);
-    uint64_t dst_pdpt = pte_addr(dst.pml4[0]);
+    uint64_t src_pdpt = pte_addr(src.pml4[1]);
+    uint64_t dst_pdpt = pte_addr(dst.pml4[1]);
     ASSERT_TRUE(dev, src_pdpt != dst_pdpt);
 
     vmm_unmap_page(&src, 0x0000008000000000);

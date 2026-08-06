@@ -141,6 +141,25 @@ vmm_status_t vmm_map_page(address_space_t *as, uint64_t vaddr,
                           uint64_t paddr, uint64_t flags);
 
 /**
+ * @brief Map a page, merging permission flags on overlap.
+ *
+ * Behaves like vmm_map_page() but, if the target virtual address is
+ * already mapped, upgrades the existing PTE's permissions by OR-ing
+ * the new flags into it (keeping the existing physical frame).  NX is
+ * dropped whenever either mapping allows execution.  This lets ELF
+ * PT_LOAD segments that share a page (e.g. a read-exec text tail
+ * covered by a read-write data segment) map cleanly.
+ *
+ * @param as     Target address space.
+ * @param vaddr  Virtual address (must be page-aligned, canonical).
+ * @param paddr  Physical address (only used for fresh mappings).
+ * @param flags  PTE flags (VMM_FLAG_WRITE, VMM_FLAG_USER, etc.).
+ * @return VMM_OK on success, or an error code.
+ */
+vmm_status_t vmm_map_page_merge(address_space_t *as, uint64_t vaddr,
+                                uint64_t paddr, uint64_t flags);
+
+/**
  * @brief Unmap a virtual address.
  *
  * Clears the leaf PTE and flushes the TLB.  If the page table page

@@ -77,7 +77,11 @@ static void test_gdt_cs_loads(serial_dev_t *dev) {
  * Test 4: User-mode segment descriptors carry DPL == 3.
  *
  * Reads the live GDT directly and extracts the DPL field from the access
- * byte of entries [3] (user code) and [4] (user data).
+ * byte of entries [3] (user data) and [4] (user code).
+ *
+ * Note: user data is at index 3 and user code at index 4 by design —
+ * SYSRET derives SS = STAR[63:48]+8 and CS = STAR[63:48]+16, so the data
+ * descriptor must sit one index below the code descriptor.
  *
  * In the 8-byte descriptor, the access byte lives at bits [47:40].  Within
  * that byte, DPL occupies bits [6:5].  Equivalently, in the full 64-bit

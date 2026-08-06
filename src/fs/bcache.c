@@ -295,6 +295,34 @@ void bcache_put(buf_t *buf) {
     if (buf->ref_count > 0) {
         buf->ref_count--;
     }
+
+    /* Write-through: when the last reference is released and the buffer
+     * is dirty, write it back to the device immediately.  This guarantees
+     * writes reach the disk even on an unclean shutdown (e.g. closing the
+     * QEMU window), so files/directories created in the shell persist. */
+    if (buf->ref_count == 0 &&
+        (buf->flags & BCACHE_FLAG_VALID) &&
+        (buf->flags & BCACHE_FLAG_DIRTY)) {
+        uint8_t dev = buf->dev_id;
+        uint32_t blk = buf->block_num;
+        uint8_t copy[BCACHE_SECTOR_SIZE];
+        memcpy(copy, buf->data, BCACHE_SECTOR_SIZE);
+        spin_unlock(&g_lock, rflags);
+
+        block_status_t st = block_dev_write(dev, blk, 1, copy);
+        if (st == BLOCK_OK) {
+            rflags = spin_lock(&g_lock);
+            buf->flags &= ~BCACHE_FLAG_DIRTY;
+            g_stats.flushes++;
+            spin_unlock(&g_lock, rflags);
+            return;
+        }
+
+        /* Leave the buffer dirty so a later flush/eviction retries it. */
+        bc_log("[BCACHE] WARN: write-through failed, keeping dirty\r\n");
+        return;
+    }
+
     spin_unlock(&g_lock, rflags);
 }
 

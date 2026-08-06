@@ -6,8 +6,8 @@
  *   sc_sys_count            — SYS_COUNT == 7
  *   sc_syscall_numbers      — all syscall numbers are sequential
  *   sc_dispatch_table_size  — dispatch table has SYS_COUNT entries
- *   sc_user_cs_selector     — GDT_USER_CS_SEL == 0x1B
- *   sc_user_ds_selector     — GDT_USER_DS_SEL == 0x23
+ *   sc_user_cs_selector     — GDT_USER_CS_SEL == 0x23
+ *   sc_user_ds_selector     — GDT_USER_DS_SEL == 0x1B
  *   sc_kernel_cs_selector   — GDT_KERNEL_CS_SEL == 0x08
  *   sc_kernel_ds_selector   — GDT_KERNEL_DS_SEL == 0x10
  *   sc_tss_selector         — GDT_TSS_SEL == 0x28
@@ -23,7 +23,7 @@
 
 /* ---- Test: SYS_COUNT matches expected slot count ---- */
 static void test_sc_sys_count(serial_dev_t *dev) {
-    ASSERT_EQ(dev, SYS_COUNT, 75);
+    ASSERT_EQ(dev, SYS_COUNT, 89);
 }
 
 /* ---- Test: syscall numbers are sequential starting at 0 ---- */
@@ -38,12 +38,14 @@ static void test_sc_syscall_numbers(serial_dev_t *dev) {
 }
 
 /* ---- Test: GDT selectors are correct ---- */
+/* User data must sit one GDT index below user code so SYSRET
+ * (SS = STAR[63:48]+8, CS = STAR[63:48]+16) lands on both segments. */
 static void test_sc_user_cs_selector(serial_dev_t *dev) {
-    ASSERT_EQ(dev, GDT_USER_CS_SEL, 0x1B);
+    ASSERT_EQ(dev, GDT_USER_CS_SEL, 0x23);
 }
 
 static void test_sc_user_ds_selector(serial_dev_t *dev) {
-    ASSERT_EQ(dev, GDT_USER_DS_SEL, 0x23);
+    ASSERT_EQ(dev, GDT_USER_DS_SEL, 0x1B);
 }
 
 static void test_sc_kernel_cs_selector(serial_dev_t *dev) {

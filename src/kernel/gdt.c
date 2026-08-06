@@ -204,8 +204,13 @@ void gdt_init(void) {
     g_gdt[0] = 0;                                   /* [0] null  — must be zero   */
     g_gdt[1] = encode_segment_descriptor(0, 1);     /* [1] kcode — ring 0, exec   */
     g_gdt[2] = encode_segment_descriptor(0, 0);     /* [2] kdata — ring 0, data   */
-    g_gdt[3] = encode_segment_descriptor(3, 1);     /* [3] ucode — ring 3, exec   */
-    g_gdt[4] = encode_segment_descriptor(3, 0);     /* [4] udata — ring 3, data   */
+    g_gdt[3] = encode_segment_descriptor(3, 0);     /* [3] udata — ring 3, data
+                                                     *     one index below ucode
+                                                     *     so SYSRET SS = base+8
+                                                     *     lands here */
+    g_gdt[4] = encode_segment_descriptor(3, 1);     /* [4] ucode — ring 3, exec
+                                                     *     SYSRET CS = base+16
+                                                     *     lands here */
 
     /* ------------------------------------------------------------------
      * Build the 16-byte TSS system descriptor (two contiguous GDT slots).

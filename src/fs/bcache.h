@@ -139,8 +139,10 @@ buf_t *bcache_get(uint8_t dev_id, uint32_t block_num);
 /**
  * @brief Release a buffer (decrement reference count).
  *
- * If ref_count reaches zero, the buffer becomes a candidate for
- * eviction.  The buffer data is NOT written to disk by this call.
+ * If ref_count reaches zero and the buffer is dirty, it is written back
+ * to the device immediately (write-through), so data persists even on
+ * an unclean shutdown.  A copy is written to avoid races, and the buffer
+ * stays cached (clean) for fast re-reads.
  *
  * @param buf  Buffer returned by bcache_get().  NULL is a no-op.
  */
@@ -149,8 +151,9 @@ void bcache_put(buf_t *buf);
 /**
  * @brief Mark a buffer as dirty (modified).
  *
- * The buffer will be written to disk on the next bcache_flush_dev()
- * or when evicted.
+ * The buffer will be written to disk when the last reference is released
+ * (write-through), on bcache_flush_dev()/bcache_flush_all(), or when
+ * evicted.
  *
  * @param buf  Buffer returned by bcache_get().  NULL is a no-op.
  */

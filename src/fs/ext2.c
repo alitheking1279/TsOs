@@ -21,6 +21,7 @@
 #include "vfs.h"
 #include "block_dev.h"
 #include "../drivers/serial.h"
+#include "../lib/print.h"
 #include "../kernel/kheap.h"
 #include "../kernel/task.h"
 #include <stdint.h>
@@ -42,6 +43,10 @@ static serial_dev_t *g_ext2_serial = NULL;
 
 static void ext2_log(const char *msg) {
     if (g_ext2_serial) serial_write_string(g_ext2_serial, msg);
+}
+
+static void ext2_log_hex32(uint32_t v) {
+    if (g_ext2_serial) print_hex32(g_ext2_serial, v);
 }
 
 /* =========================================================================
@@ -179,15 +184,14 @@ ext2_status_t ext2_mount(uint8_t dev_id) {
                      / g_fs.descs_per_group;
 
     /* --- Read group descriptors (starts at block 2 for 1K blocks) --- */
-    uint32_t gd_bytes = g_fs.num_groups * sizeof(ext2_group_desc_t);
+    uint32_t gd_bytes = g_fs.desc_blocks * g_fs.block_size;
     g_fs.gd = (ext2_group_desc_t *)kmalloc(gd_bytes);
     if (!g_fs.gd) {
         ext2_log("[EXT2] ERR: no memory for group descriptors\r\n");
         return EXT2_ERR_NO_MEM;
     }
 
-    /* Read descriptor blocks. For typical configurations, one block is enough
-     * (32 descriptors * 32 bytes = 1024 bytes = 1 block for 1K blocks). */
+    /* Read descriptor blocks. */
     for (uint32_t b = 0; b < g_fs.desc_blocks; b++) {
         uint32_t offset = b * g_fs.block_size;
         uint32_t remaining = gd_bytes - offset;
@@ -553,6 +557,14 @@ int64_t ext2_read_file(uint32_t ino, void *buf, uint64_t offset, uint64_t count)
     if (ext2_read_inode(ino, &inode) != EXT2_OK) return -1;
 
     uint64_t file_size = (uint64_t)inode.i_size;
+    ext2_log("[EXT2] read_file: ino="); ext2_log_hex32(ino);
+    ext2_log(" offset="); print_hex64(g_ext2_serial, offset);
+    ext2_log(" count="); print_hex64(g_ext2_serial, count);
+    ext2_log(" i_size="); print_hex64(g_ext2_serial, file_size);
+    ext2_log(" i_blocks="); ext2_log_hex32(inode.i_blocks);
+    ext2_log(" i_block[0]="); ext2_log_hex32(inode.i_block[0]);
+    ext2_log("\r\n");
+
     if (offset >= file_size) return 0;
 
     /* Clamp count to end of file. */
@@ -569,13 +581,20 @@ int64_t ext2_read_file(uint32_t ino, void *buf, uint64_t offset, uint64_t count)
                                                   g_fs.block_size - block_off);
 
         uint32_t phys = ext2_inode_get_block(&inode, logical);
+        ext2_log("[EXT2] read_file: logical="); ext2_log_hex32(logical);
+        ext2_log(" phys="); ext2_log_hex32(phys);
+        ext2_log(" to_read="); ext2_log_hex32(to_read);
+        ext2_log("\r\n");
 
         if (phys == 0) {
-            /* Sparse hole — zero-fill. */
+            ext2_log("[EXT2] read_file: sparse hole\r\n");
             memset(dst, 0, to_read);
         } else {
             uint8_t blk_buf[1024];
-            if (ext2_read_block(phys, blk_buf) != EXT2_OK) return (int64_t)total_read;
+            if (ext2_read_block(phys, blk_buf) != EXT2_OK) {
+                ext2_log("[EXT2] read_file: read_block FAILED phys="); ext2_log_hex32(phys); ext2_log("\r\n");
+                return (int64_t)total_read;
+            }
             memcpy(dst, blk_buf + block_off, to_read);
         }
 
@@ -585,6 +604,7 @@ int64_t ext2_read_file(uint32_t ino, void *buf, uint64_t offset, uint64_t count)
         total_read += to_read;
     }
 
+    ext2_log("[EXT2] read_file: returning "); print_hex64(g_ext2_serial, (uint64_t)total_read); ext2_log("\r\n");
     return (int64_t)total_read;
 }
 
@@ -593,8 +613,20 @@ int64_t ext2_write_file(uint32_t ino, const void *buf, uint64_t offset,
     if (!g_fs.mounted) return -1;
     if (!buf && count > 0) return -1;
 
+    ext2_log("[EXT2] write_file: ino="); ext2_log_hex32(ino);
+    ext2_log(" offset="); print_hex64(g_ext2_serial, offset);
+    ext2_log(" count="); print_hex64(g_ext2_serial, count);
+    ext2_log("\r\n");
+
     ext2_inode_t inode;
-    if (ext2_read_inode(ino, &inode) != EXT2_OK) return -1;
+    if (ext2_read_inode(ino, &inode) != EXT2_OK) {
+        ext2_log("[EXT2] write_file: read_inode FAILED\r\n");
+        return -1;
+    }
+
+    ext2_log("[EXT2] write_file: i_size="); ext2_log_hex32(inode.i_size);
+    ext2_log(" i_blocks="); ext2_log_hex32(inode.i_blocks);
+    ext2_log("\r\n");
 
     uint64_t total_written = 0;
     const uint8_t *src = (const uint8_t *)buf;
@@ -607,15 +639,29 @@ int64_t ext2_write_file(uint32_t ino, const void *buf, uint64_t offset,
                                                    g_fs.block_size - block_off);
 
         uint32_t phys = ext2_inode_get_block(&inode, logical);
+        ext2_log("[EXT2] write_file: logical="); ext2_log_hex32(logical);
+        ext2_log(" phys="); ext2_log_hex32(phys);
+        ext2_log(" to_write="); ext2_log_hex32(to_write);
+        ext2_log("\r\n");
 
         /* Allocate a block if this logical position is unmapped. */
         if (phys == 0) {
+            ext2_log("[EXT2] write_file: allocating block for logical="); ext2_log_hex32(logical); ext2_log("\r\n");
             ext2_status_t st = ext2_inode_alloc_block(ino, &inode, logical);
-            if (st != EXT2_OK) return (int64_t)total_written;
-            if (ext2_read_inode(ino, &inode) != EXT2_OK)
+            if (st != EXT2_OK) {
+                ext2_log("[EXT2] write_file: alloc_block FAILED\r\n");
                 return (int64_t)total_written;
+            }
+            if (ext2_read_inode(ino, &inode) != EXT2_OK) {
+                ext2_log("[EXT2] write_file: re-read inode FAILED\r\n");
+                return (int64_t)total_written;
+            }
             phys = ext2_inode_get_block(&inode, logical);
-            if (phys == 0) return (int64_t)total_written;
+            ext2_log("[EXT2] write_file: allocated phys="); ext2_log_hex32(phys); ext2_log("\r\n");
+            if (phys == 0) {
+                ext2_log("[EXT2] write_file: phys still zero after alloc!\r\n");
+                return (int64_t)total_written;
+            }
         }
 
         uint8_t blk_buf[1024];
@@ -640,9 +686,13 @@ int64_t ext2_write_file(uint32_t ino, const void *buf, uint64_t offset,
     /* Update file size if the write extended past the current end. */
     if (pos > (uint64_t)inode.i_size) {
         inode.i_size = (uint32_t)pos;
+        ext2_log("[EXT2] write_file: updating i_size to "); ext2_log_hex32(inode.i_size); ext2_log("\r\n");
         ext2_write_inode(ino, &inode);
+    } else {
+        ext2_log("[EXT2] write_file: i_size unchanged (pos="); print_hex64(g_ext2_serial, pos); ext2_log(" <= i_size="); ext2_log_hex32(inode.i_size); ext2_log(")\r\n");
     }
 
+    ext2_log("[EXT2] write_file: returning "); print_hex64(g_ext2_serial, (uint64_t)total_written); ext2_log("\r\n");
     return (int64_t)total_written;
 }
 
@@ -949,24 +999,37 @@ uint32_t ext2_dir_lookup(uint32_t dir_ino, const char *name) {
 }
 
 ext2_status_t ext2_dir_add_entry(uint32_t dir_ino, const char *name,
-                                 uint32_t child_ino, uint8_t file_type) {
-    if (!g_fs.mounted || !name) return EXT2_ERR_INVALID;
+                                  uint32_t child_ino, uint8_t file_type) {
+    if (!g_fs.mounted || !name) { ext2_log("[EXT2] dir_add_entry: invalid args\r\n"); return EXT2_ERR_INVALID; }
+
+    ext2_log("[EXT2] dir_add_entry: dir_ino="); ext2_log_hex32(dir_ino);
+    ext2_log(" name="); ext2_log(name);
+    ext2_log(" child_ino="); ext2_log_hex32(child_ino);
+    ext2_log(" type="); ext2_log_hex32(file_type);
+    ext2_log("\r\n");
 
     ext2_inode_t dinode;
-    if (ext2_read_inode(dir_ino, &dinode) != EXT2_OK)
+    if (ext2_read_inode(dir_ino, &dinode) != EXT2_OK) {
+        ext2_log("[EXT2] dir_add_entry: read_inode FAILED\r\n");
         return EXT2_ERR_NOT_FOUND;
-    if (!(dinode.i_mode & EXT2_S_IFDIR))
+    }
+    if (!(dinode.i_mode & EXT2_S_IFDIR)) {
+        ext2_log("[EXT2] dir_add_entry: not a directory\r\n");
         return EXT2_ERR_INVALID;
+    }
+
+    ext2_log("[EXT2] dir_add_entry: dir_size="); ext2_log_hex32(dinode.i_size); ext2_log("\r\n");
 
     uint32_t nlen   = strlen(name);
     uint32_t needed  = (8 + nlen + 3) & ~3;
     if (needed < 12) needed = 12;
 
     uint32_t nblocks = (dinode.i_size + g_fs.block_size - 1) / g_fs.block_size;
+    ext2_log("[EXT2] dir_add_entry: nblocks="); ext2_log_hex32(nblocks); ext2_log(" needed="); ext2_log_hex32(needed); ext2_log("\r\n");
 
-    /* Pass 1: try to find space in existing blocks. */
     for (uint32_t b = 0; b < nblocks; b++) {
         uint32_t phys = ext2_inode_get_block(&dinode, b);
+        ext2_log("[EXT2] dir_add_entry: scanning block "); ext2_log_hex32(b); ext2_log(" phys="); ext2_log_hex32(phys); ext2_log("\r\n");
         if (phys == 0) continue;
 
         uint8_t block_buf[1024];
@@ -981,20 +1044,15 @@ ext2_status_t ext2_dir_add_entry(uint32_t dir_ino, const char *name,
             prev = de;
             off += de->rec_len;
         }
-        /* 'prev' is the last valid entry; its rec_len covers to end-of-used. */
         if (prev) {
             uint32_t end_of_prev  = (uint32_t)((uint8_t *)prev - block_buf) + prev->rec_len;
             uint32_t slack        = g_fs.block_size - end_of_prev;
+            ext2_log("[EXT2] dir_add_entry: prev rec_len="); ext2_log_hex32(prev->rec_len);
+            ext2_log(" end="); ext2_log_hex32(end_of_prev);
+            ext2_log(" slack="); ext2_log_hex32(slack); ext2_log("\r\n");
             if (slack >= needed) {
-                /* Shrink prev's rec_len to make room, then write new entry. */
-                uint32_t old_len = prev->rec_len;
-                prev->rec_len    = end_of_prev - (uint32_t)((uint8_t *)prev - block_buf);
-                /* But wait: if prev was the last entry, its rec_len extended
-                 * to block_size. We need it to end exactly where the new
-                 * entry begins. */
                 uint32_t new_entry_off = end_of_prev;
                 prev->rec_len = (uint16_t)(new_entry_off - (uint32_t)((uint8_t *)prev - block_buf));
-                (void)old_len;
 
                 ext2_dirent_t *ne = (ext2_dirent_t *)(block_buf + new_entry_off);
                 ne->inode     = child_ino;
@@ -1003,26 +1061,25 @@ ext2_status_t ext2_dir_add_entry(uint32_t dir_ino, const char *name,
                 ne->file_type = file_type;
                 memcpy(ne->name, name, nlen);
 
+                ext2_log("[EXT2] dir_add_entry: added in existing block\r\n");
                 ext2_status_t st = ext2_write_block(phys, block_buf);
-                if (st != EXT2_OK) return st;
-
-                /* Update parent size if needed (shouldn't be for existing blocks). */
-                return EXT2_OK;
+                return st;
             }
         }
     }
 
-    /* Pass 2: allocate a new block. */
+    ext2_log("[EXT2] dir_add_entry: pass 2 — allocating new block\r\n");
     uint32_t logical = nblocks;
     ext2_status_t st = ext2_inode_alloc_block(dir_ino, &dinode, logical);
-    if (st != EXT2_OK) return st;
+    if (st != EXT2_OK) { ext2_log("[EXT2] dir_add_entry: alloc_block FAILED\r\n"); return st; }
 
-    /* Update directory size to account for the new block. */
     dinode.i_size = (logical + 1) * g_fs.block_size;
     ext2_write_inode(dir_ino, &dinode);
 
     uint32_t new_phys = ext2_inode_get_block(&dinode, logical);
-    if (new_phys == 0) return EXT2_ERR_IO;
+    if (new_phys == 0) { ext2_log("[EXT2] dir_add_entry: get_block FAILED\r\n"); return EXT2_ERR_IO; }
+
+    ext2_log("[EXT2] dir_add_entry: new phys="); ext2_log_hex32(new_phys); ext2_log("\r\n");
 
     uint8_t new_block[1024];
     memset(new_block, 0, g_fs.block_size);
@@ -1034,7 +1091,9 @@ ext2_status_t ext2_dir_add_entry(uint32_t dir_ino, const char *name,
     ne->file_type = file_type;
     memcpy(ne->name, name, nlen);
 
-    return ext2_write_block(new_phys, new_block);
+    st = ext2_write_block(new_phys, new_block);
+    ext2_log("[EXT2] dir_add_entry: DONE (new block), st="); ext2_log_hex32((uint32_t)st); ext2_log("\r\n");
+    return st;
 }
 
 ext2_status_t ext2_dir_remove_entry(uint32_t dir_ino, const char *name) {
@@ -1074,32 +1133,34 @@ ext2_status_t ext2_dir_remove_entry(uint32_t dir_ino, const char *name) {
 }
 
 uint32_t ext2_mkdir(uint32_t parent_ino, const char *name) {
-    if (!g_fs.mounted || !name) return 0;
+    if (!g_fs.mounted || !name) {
+        ext2_log("[EXT2] mkdir: not mounted or null name\r\n");
+        return 0;
+    }
 
-    /* Allocate a new inode. */
+    ext2_log("[EXT2] mkdir: parent_ino="); ext2_log_hex32(parent_ino); ext2_log(" name="); ext2_log(name); ext2_log("\r\n");
+
     int32_t new_ino = ext2_alloc_inode();
-    if (new_ino < 0) return 0;
+    if (new_ino < 0) { ext2_log("[EXT2] mkdir: alloc_inode FAILED\r\n"); return 0; }
+    ext2_log("[EXT2] mkdir: alloc_inode -> "); ext2_log_hex32((uint32_t)new_ino); ext2_log("\r\n");
 
-    /* Set up the directory inode. */
     ext2_inode_t inode;
     memset(&inode, 0, sizeof(inode));
     inode.i_mode        = EXT2_S_IFDIR | 0755;
     inode.i_links_count = 2;
     ext2_status_t st = ext2_write_inode((uint32_t)new_ino, &inode);
-    if (st != EXT2_OK) return 0;
+    if (st != EXT2_OK) { ext2_log("[EXT2] mkdir: write_inode FAILED\r\n"); return 0; }
 
-    /* Allocate a data block for directory entries. */
     st = ext2_inode_alloc_block((uint32_t)new_ino, &inode, 0);
-    if (st != EXT2_OK) return 0;
+    if (st != EXT2_OK) { ext2_log("[EXT2] mkdir: alloc_block FAILED\r\n"); return 0; }
 
-    /* Set directory size to one block. */
     inode.i_size = g_fs.block_size;
     ext2_write_inode((uint32_t)new_ino, &inode);
 
     uint32_t phys = ext2_inode_get_block(&inode, 0);
-    if (phys == 0) return 0;
+    if (phys == 0) { ext2_log("[EXT2] mkdir: get_block FAILED\r\n"); return 0; }
+    ext2_log("[EXT2] mkdir: dir phys_block="); ext2_log_hex32(phys); ext2_log("\r\n");
 
-    /* Write "." and ".." entries. */
     uint8_t block_buf[1024];
     memset(block_buf, 0, g_fs.block_size);
 
@@ -1119,24 +1180,22 @@ uint32_t ext2_mkdir(uint32_t parent_ino, const char *name) {
     de->name[1]   = '.';
 
     st = ext2_write_block(phys, block_buf);
-    if (st != EXT2_OK) return 0;
+    if (st != EXT2_OK) { ext2_log("[EXT2] mkdir: write_block FAILED\r\n"); return 0; }
 
-    /* Add entry to parent directory. */
     st = ext2_dir_add_entry(parent_ino, name, (uint32_t)new_ino, EXT2_FT_DIR);
-    if (st != EXT2_OK) return 0;
+    if (st != EXT2_OK) { ext2_log("[EXT2] mkdir: dir_add_entry FAILED\r\n"); return 0; }
 
-    /* Increment parent's link count. */
     ext2_inode_t pinode;
     st = ext2_read_inode(parent_ino, &pinode);
-    if (st != EXT2_OK) return (uint32_t)new_ino;
+    if (st != EXT2_OK) { ext2_log("[EXT2] mkdir: read_parent FAILED\n"); return (uint32_t)new_ino; }
     pinode.i_links_count++;
     ext2_write_inode(parent_ino, &pinode);
 
-    /* Increment group's used_dirs_count. */
     uint32_t group = EXT2_INO_GROUP((uint32_t)new_ino, g_fs.inodes_per_group);
     g_fs.gd[group].bg_used_dirs_count++;
     ext2_write_block(2, g_fs.gd);
 
+    ext2_log("[EXT2] mkdir: DONE new_ino="); ext2_log_hex32((uint32_t)new_ino); ext2_log("\r\n");
     return (uint32_t)new_ino;
 }
 
@@ -1511,7 +1570,7 @@ void ext2_split_path(const char *path, char *parent, char *name) {
 }
 
 uint32_t ext2_resolve_path(const char *path) {
-    if (!g_fs.mounted || !path) return 0;
+    if (!g_fs.mounted || !path) { ext2_log("[EXT2] resolve_path: not mounted or null\r\n"); return 0; }
 
     uint32_t current = EXT2_ROOT_INO;
 
@@ -1519,7 +1578,12 @@ uint32_t ext2_resolve_path(const char *path) {
     while (*path == '/') path++;
 
     /* Empty path or just "/" → root. */
-    if (*path == '\0') return EXT2_ROOT_INO;
+    if (*path == '\0') {
+        ext2_log("[EXT2] resolve_path: '/' -> ino=2\r\n");
+        return EXT2_ROOT_INO;
+    }
+
+    ext2_log("[EXT2] resolve_path: "); ext2_log(path); ext2_log(" -> ");
 
     /* Process each component. */
     while (*path) {
@@ -1547,6 +1611,7 @@ uint32_t ext2_resolve_path(const char *path) {
         if (*path == '/') path++;
     }
 
+    ext2_log("ino="); ext2_log_hex32(current); ext2_log("\r\n");
     return current;
 }
 
@@ -1607,6 +1672,10 @@ static int ext2_vfs_open(const char *rel_path, uint32_t flags,
     }
 
     uint32_t ino = ext2_resolve_path(full);
+    ext2_log("[EXT2] vfs_open: path="); ext2_log(full);
+    ext2_log(" flags="); ext2_log_hex32(flags);
+    ext2_log(" ino="); ext2_log_hex32(ino);
+    ext2_log("\r\n");
 
     if (ino == 0 && (flags & O_CREAT)) {
         char parent[EXT2_MAX_PATH];
@@ -1755,6 +1824,7 @@ static int ext2_vfs_rename(const char *old_rel, const char *new_rel) {
 
 static int ext2_vfs_mkdir(const char *rel_path, uint32_t mode) {
     (void)mode;
+    ext2_log("[EXT2] vfs_mkdir rel_path="); ext2_log(rel_path); ext2_log("\r\n");
     char full[EXT2_MAX_PATH];
     if (rel_path[0] == '/') {
         int i = 0;
@@ -1767,18 +1837,23 @@ static int ext2_vfs_mkdir(const char *rel_path, uint32_t mode) {
         full[i + 1] = '\0';
     }
 
+    ext2_log("[EXT2] vfs_mkdir full="); ext2_log(full); ext2_log("\r\n");
     char parent[EXT2_MAX_PATH], name[EXT2_MAX_PATH];
     ext2_split_path(full, parent, name);
-    if (name[0] == '\0') return -1;
+    ext2_log("[EXT2] vfs_mkdir parent="); ext2_log(parent); ext2_log(" name="); ext2_log(name); ext2_log("\r\n");
+    if (name[0] == '\0') { ext2_log("[EXT2] vfs_mkdir: empty name\r\n"); return -1; }
 
     uint32_t parent_ino = ext2_resolve_path(parent);
-    if (parent_ino == 0) return -1;
+    if (parent_ino == 0) { ext2_log("[EXT2] vfs_mkdir: parent not found\r\n"); return -1; }
 
-    return (ext2_mkdir(parent_ino, name) != 0) ? 0 : -1;
+    uint32_t ret = ext2_mkdir(parent_ino, name);
+    ext2_log("[EXT2] vfs_mkdir: ret="); ext2_log_hex32(ret); ext2_log("\r\n");
+    return (ret != 0) ? 0 : -1;
 }
 
 static int ext2_vfs_getdents(const char *rel_path, uint64_t *cookie,
                               void *buf, uint32_t count) {
+    ext2_log("[EXT2] vfs_getdents rel_path="); ext2_log(rel_path); ext2_log("\r\n");
     char full[EXT2_MAX_PATH];
     if (rel_path[0] == '/') {
         int i = 0;
@@ -1791,10 +1866,13 @@ static int ext2_vfs_getdents(const char *rel_path, uint64_t *cookie,
         full[i + 1] = '\0';
     }
 
+    ext2_log("[EXT2] vfs_getdents full="); ext2_log(full); ext2_log("\r\n");
     uint32_t ino = ext2_resolve_path(full);
-    if (ino == 0) return -1;
+    if (ino == 0) { ext2_log("[EXT2] vfs_getdents: resolve FAILED\r\n"); return -1; }
 
-    return (int)ext2_getdents(ino, cookie, buf, count);
+    int ret = (int)ext2_getdents(ino, cookie, buf, count);
+    ext2_log("[EXT2] vfs_getdents: ret="); ext2_log_hex32(ret); ext2_log(" cookie="); ext2_log_hex32((uint32_t)*cookie); ext2_log("\r\n");
+    return ret;
 }
 
 vfs_fs_ops_t ext2_vfs_ops = {

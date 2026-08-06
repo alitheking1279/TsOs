@@ -171,9 +171,11 @@ static void test_idt_doublefault_ist1(serial_dev_t *dev) {
  * PIC tests (4 tests)
  * ========================================================================= */
 
-/** Test 6: Master PIC IMR — all IRQs masked except IRQ0 (timer_init unmasks IRQ0). */
+/** Test 6: Master PIC IMR — IRQ0 (timer) and IRQ1 (keyboard) unmasked, rest masked. */
 static void test_pic_imr_master_masked(serial_dev_t *dev) {
-    ASSERT_EQ(dev, (uint32_t)pic_get_imr_master(), (uint32_t)0xFE);
+    /* After timer_init unmasks IRQ0 and ps2_init unmasks IRQ1,
+     * bits 0 and 1 are clear → 0xFC. */
+    ASSERT_EQ(dev, (uint32_t)pic_get_imr_master(), (uint32_t)0xFC);
 }
 
 /** Test 7: Slave PIC IMR == 0xFF (all IRQs masked) after init. */
@@ -188,10 +190,14 @@ static void test_pic_mask_unmask(serial_dev_t *dev) {
     uint8_t imr = pic_get_imr_master();
     ASSERT_TRUE(dev, (imr & 0x01) == 0);  /* bit 0 must be clear */
 
-    /* Mask IRQ0 — set bit 0 in master IMR */
+    /* Mask IRQ0 — set bit 0 in master IMR.
+     * IRQ1 (keyboard) is still unmasked, so IMR = 0xFD. */
     pic_mask_irq(0);
     imr = pic_get_imr_master();
-    ASSERT_EQ(dev, (uint32_t)imr, (uint32_t)0xFF);  /* all masked again */
+    ASSERT_EQ(dev, (uint32_t)imr, (uint32_t)0xFD);
+
+    /* Restore: re-unmask IRQ0 so the timer keeps ticking. */
+    pic_unmask_irq(0);
 }
 
 /** Test 9: Sending EOI for various IRQ lines does not crash/hang. */

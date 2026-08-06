@@ -308,6 +308,17 @@ void task_wake(task_t *task);
  */
 task_t *task_find_by_pid(uint64_t pid);
 
+/**
+ * @brief Return the head of the global task list (read-only walk).
+ *
+ * Walk using task->g_next. The list is modified only by task_create /
+ * task_destroy, which run with interrupts enabled but never concurrently
+ * with the shell (single-core, cooperative in the shell body).
+ *
+ * @return Head of global task list, or NULL if empty.
+ */
+task_t *task_get_list_head(void);
+
 #ifdef __cplusplus
 }
 #endif

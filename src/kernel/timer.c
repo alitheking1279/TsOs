@@ -12,6 +12,7 @@
 #include "isr.h"
 #include "../drivers/pit.h"
 #include "../drivers/serial.h"
+#include "../drivers/vga.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -130,8 +131,21 @@ void timer_wait_ticks(uint64_t ticks) {
 void timer_irq_handler(interrupt_frame_t *frame) {
     g_ticks++;
 
-    /* Drive the scheduler — this weak symbol becomes scheduler_tick()
-     * when the scheduler module is linked. */
+    vga_tick();
+
+    /* Send EOI BEFORE calling scheduler_tick.
+     *
+     * When context_switch() switches to a new task for the first time,
+     * it does a `ret` into the new task's entry function — but we're
+     * still inside the timer ISR call chain.  The new task (e.g. the
+     * shell) runs an infinite loop and never returns to isr_common_handler,
+     * so EOI would never be sent.  With the PIC's in-service bit stuck,
+     * no further IRQ 0 (or any lower/equal priority IRQ) would fire.
+     *
+     * Sending EOI here ensures the PIC is always cleared, regardless of
+     * whether context_switch abandons this call chain. */
+    pic_send_eoi(0);
+
     scheduler_tick(frame);
 }
 

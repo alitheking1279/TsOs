@@ -190,6 +190,23 @@ elf_status_t elf_load(const void *data, size_t size,
         if (ph->p_flags & PF_W) flags |= PTE_WRITABLE;
         if (!(ph->p_flags & PF_X)) flags |= PTE_NX;    /* NX if not executable */
 
+        /* Copy the file bytes that overlap the page [va, va+PAGE_SIZE).
+         * Handles the first page of a segment whose start is not
+         * page-aligned (the page may already be mapped by the previous
+         * segment and must only receive its own bytes). */
+        void copy_page_overlap(void *frame_virt, uint64_t va) {
+            uint64_t seg_end = ph->p_vaddr + ph->p_filesz;
+            uint64_t page_end = va + PAGE_SIZE;
+            uint64_t lo = (va > ph->p_vaddr) ? va : ph->p_vaddr;
+            uint64_t hi = (page_end < seg_end) ? page_end : seg_end;
+            if (lo >= hi) return;
+            uint64_t copy_len = hi - lo;
+            uint64_t dest_off = lo - va;
+            uint64_t src_off = ph->p_offset + (lo - ph->p_vaddr);
+            memcpy((uint8_t *)frame_virt + dest_off,
+                   file + src_off, copy_len);
+        }
+
         elf_log("[ELF] PT_LOAD @ vaddr=");
         elf_log_hex(ph->p_vaddr);
         elf_log(" filesz=");
@@ -200,6 +217,25 @@ elf_status_t elf_load(const void *data, size_t size,
 
         /* Map each page in this segment. */
         for (uint64_t va = vstart; va < vend; va += PAGE_SIZE) {
+            /* If the page is already mapped (a previous PT_LOAD covers
+             * this page too — happens when segments share a page), write
+             * this segment's bytes into the existing frame and upgrade
+             * permissions instead of mapping a fresh frame. */
+            uint64_t existing = vmm_translate(as, va);
+
+            if (existing != 0) {
+                /* Existing frame: copy this segment's bytes on top. */
+                void *frame_virt = pt_phys_to_virt(existing);
+                copy_page_overlap(frame_virt, va);
+
+                vmm_status_t mst = vmm_map_page_merge(as, va, existing, flags);
+                if (mst != VMM_OK) {
+                    elf_log("[ELF] ERR: vmm_map_page_merge failed\r\n");
+                    return ELF_ERR_MAP_FAILED;
+                }
+                continue;
+            }
+
             /* Allocate a physical frame. */
             uint64_t frame = pmm_alloc_frame();
             if (frame == 0) {
@@ -212,16 +248,10 @@ elf_status_t elf_load(const void *data, size_t size,
             memset(frame_virt, 0, PAGE_SIZE);
 
             /* Copy file data into this page if it overlaps p_filesz. */
-            uint64_t seg_voff = va - ph->p_vaddr;
-            if (seg_voff < ph->p_filesz) {
-                uint64_t copy_start = ph->p_offset + seg_voff;
-                uint64_t copy_len = ph->p_filesz - seg_voff;
-                if (copy_len > PAGE_SIZE) copy_len = PAGE_SIZE;
-                memcpy(frame_virt, file + copy_start, copy_len);
-            }
+            copy_page_overlap(frame_virt, va);
 
             /* Map into address space. */
-            vmm_status_t mst = vmm_map_page(as, va, frame, flags);
+            vmm_status_t mst = vmm_map_page_merge(as, va, frame, flags);
             if (mst != VMM_OK) {
                 elf_log("[ELF] ERR: vmm_map_page failed\r\n");
                 return ELF_ERR_MAP_FAILED;

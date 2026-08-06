@@ -3,9 +3,10 @@
 
 #include "../drivers/serial.h"
 
-/* Raised from 256 → 512 to accommodate the full test suite.
- * At 256 the registry silently drops any test registered after slot 255. */
-#define TEST_MAX 544
+/* Raised from 590 → 800 to accommodate the VBE/fb tests (606 registered)
+ * plus headroom for the doom port's shim tests.
+ * The registry silently drops any test registered after slot TEST_MAX-1. */
+#define TEST_MAX 800
 
 typedef void (*test_fn)(serial_dev_t *dev);
 

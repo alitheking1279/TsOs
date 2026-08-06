@@ -8,8 +8,10 @@
  *
  * MSR configuration:
  *   EFER.SCE = 1     (enable SYSCALL instruction, set in boot.asm)
- *   STAR      = 0x0013000800000000  (kernel CS=0x08, SS=0x10;
- *                                     user CS=0x1B, SS=0x23)
+ *   STAR      = 0x0013000800000000
+ *                [63:48] SYSRET base 0x13 → CS = base+16 = 0x23 (user code),
+ *                        SS  = base+8  = 0x1B (user data, GDT idx 3)
+ *                [47:32] SYSCALL CS 0x08 → SS = CS+8 = 0x10 (kernel data)
  *   LSTAR     = &syscall_entry  (kernel entry point)
  *   SFMASK    = 0x200           (clear IF on SYSCALL — disable interrupts)
  *
@@ -56,12 +58,49 @@ extern "C" {
 #define SYS_UNLINK      72
 #define SYS_GETDENTS    73
 #define SYS_RENAME      74
+#define SYS_USLEEP      75
+#define SYS_GETTIMEOFDAY 76
+#define SYS_MKDIR       77
+#define SYS_RMDIR       78
+#define SYS_GET_KEY         79
+#define SYS_VGA_WRITE       80
+#define SYS_VGA_CLEAR       81
+#define SYS_VGA_SET_COLOR   82
+#define SYS_BEEP            83
+#define SYS_REBOOT          84
+#define SYS_VGA_CURSOR_LEFT 85
+#define SYS_VGA_CURSOR_RIGHT 86
+#define SYS_VGA_BACKSPACE   87
+#define SYS_VGA_INSERT_CHAR 88
+#define SYS_VGA_GET_CURSOR  89
+#define SYS_VGA_SET_CURSOR  90
+#define SYS_UPTIME          91
+#define SYS_SYSINFO         92
+#define SYS_SHUTDOWN        93
+#define SYS_VGA_PUT_CHAR    94
+#define SYS_VGA_SCROLL      95
+#define SYS_VGA_CURSOR_ENABLE 96
 
 /** Total number of syscall slots. */
-#define SYS_COUNT       75
+#define SYS_COUNT       97
 
 /** Invalid/unimplemented syscall number. */
 #define SYS_INVALID     (-1)
+
+/* =========================================================================
+ * System Information Structure (SYS_SYSINFO)
+ *
+ * Layout must match the userspace copy in src/libc/userspace/syscalls.h.
+ * ========================================================================= */
+
+typedef struct {
+    uint64_t mem_total;     /**< Total physical memory in bytes. */
+    uint64_t mem_free;      /**< Currently free physical memory in bytes. */
+    uint64_t mem_used;      /**< Currently used/reserved physical memory in bytes. */
+    uint64_t mem_reserved;  /**< Frames reserved at init (kernel + bitmap), in bytes. */
+    uint64_t task_count;    /**< Number of active tasks. */
+    uint64_t uptime_ticks;  /**< Monotonic uptime in 10 ms ticks (100 Hz PIT). */
+} sysinfo_t;
 
 /* =========================================================================
  * Per-CPU Data (single-core: one static instance)
@@ -73,7 +112,7 @@ extern "C" {
 
 typedef struct {
     uint64_t kernel_rsp;    /**< [+0] Current task's kernel stack pointer. */
-    uint64_t reserved;      /**< [+8] Reserved for future per-CPU fields. */
+    uint64_t saved_user_rsp;/**< [+8] User RSP stashed by syscall_entry before stack switch. */
 } __attribute__((packed)) per_cpu_data_t;
 
 /* =========================================================================

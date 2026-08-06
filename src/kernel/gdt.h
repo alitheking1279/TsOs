@@ -9,14 +9,20 @@
  *     0      0x00     -    -     null        Required; never referenced
  *     1      0x08     0   64-bit code        Kernel execute/read, L=1
  *     2      0x10     0   flat   data        Kernel read/write
- *     3      0x18     3   64-bit code        User execute/read, L=1
- *     4      0x20     3   flat   data        User read/write
+ *     3      0x18     3   flat   data        User read/write
+ *     4      0x20     3   64-bit code        User execute/read, L=1
  *     5+6    0x28     0   16B    TSS system  Available 64-bit TSS
  *
  * The TSS descriptor occupies two consecutive 8-byte GDT slots (indices 5
  * and 6) because the full 64-bit base address cannot fit in a single 8-byte
  * segment descriptor — this two-slot layout is mandated by the CPU hardware
  * (Intel SDM Vol.3A §7.2.3).
+ *
+ * IMPORTANT — user segment ordering: SYSRET derives the user-mode selectors
+ * from STAR[63:48] as CS = base+16 and SS = base+8 (Intel SDM Vol.3A §3.3.1).
+ * The user data descriptor must therefore occupy the GDT index immediately
+ * BELOW the user code descriptor: data at index 3 (0x1B), code at index 4
+ * (0x23).  With STAR base = 0x13 the CPU lands exactly on both segments.
  *
  * Segment selector encoding:  index[15:3] | TI[2]=0 (GDT) | RPL[1:0]
  * User selectors include RPL=3, e.g. index 3 → 0x18 | 3 = 0x1B.
@@ -49,11 +55,15 @@ extern "C" {
 /** Kernel data segment: GDT index 2, TI=0, RPL=0 → selector 0x10. */
 #define GDT_KERNEL_DS_SEL    ((uint16_t)0x10)
 
-/** User code segment: GDT index 3, TI=0, RPL=3 → selector 0x1B. */
-#define GDT_USER_CS_SEL      ((uint16_t)0x1B)
+/** User data segment: GDT index 3, TI=0, RPL=3 → selector 0x1B.
+ *  Must sit one index below GDT_USER_CS_SEL so SYSRET (SS = STAR[63:48]+8)
+ *  lands on this segment (see the layout note above). */
+#define GDT_USER_DS_SEL      ((uint16_t)0x1B)
 
-/** User data segment: GDT index 4, TI=0, RPL=3 → selector 0x23. */
-#define GDT_USER_DS_SEL      ((uint16_t)0x23)
+/** User code segment: GDT index 4, TI=0, RPL=3 → selector 0x23.
+ *  STAR[63:48] = GDT_USER_CS_SEL - 16 so SYSRET (CS = STAR[63:48]+16)
+ *  lands on this segment. */
+#define GDT_USER_CS_SEL      ((uint16_t)0x23)
 
 /**
  * TSS segment: GDT index 5, TI=0, RPL=0 → selector 0x28.
@@ -193,8 +203,11 @@ uint64_t gdt_get_tss_address(void);
 /** SYSCALL RFLAGS Mask — bits to clear in RFLAGS on SYSCALL entry. */
 #define MSR_SFMASK          0xC0000084
 
-/** Kernel GS Base — used for per-CPU data access via SWAPGS. */
+/** User GS Base — the GS base in effect in user mode. */
 #define MSR_GS_BASE         0xC0000101
+
+/** Kernel GS Base — swapped into GS by SWAPGS (per-CPU data). */
+#define MSR_KERNEL_GS_BASE  0xC0000102
 
 /** SYSCALL entry point address (defined in syscall_entry.asm). */
 extern uint64_t syscall_entry_addr;

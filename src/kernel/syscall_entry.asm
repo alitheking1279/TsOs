@@ -9,10 +9,11 @@
 ;   - CPU clears RFLAGS.IF (masked by SFMASK)
 ;
 ; This trampoline:
-;   1. Loads the kernel stack pointer from per-CPU data (GS:[0])
+;   1. Saves the user RSP into per-CPU scratch (GS:[8]) and loads the kernel
+;      stack pointer from per-CPU data (GS:[0])
 ;   2. Saves all general-purpose registers onto the kernel stack
 ;   3. Calls the C syscall_handler(frame_ptr)
-;   4. Restores registers and returns to user mode via SYSRET
+;   4. Restores registers (incl. user RSP) and returns to user mode via SYSRET
 ;
 ; Frame layout (offsets from frame pointer passed to C handler):
 ;   +0   rax   (syscall number / return value)
@@ -46,51 +47,60 @@ syscall_entry:
     ; --- Swap GS: kernel GS now accessible via GS:[0] ---
     swapgs
 
-    ; --- Load kernel RSP from per-CPU data ---
+    ; --- Save user RSP (SYSRET does not restore it), then load kernel RSP ---
+    mov [gs:8], rsp
     mov rsp, qword [gs:0]
 
-    ; --- Build the syscall frame (push order = reverse of offset order) ---
-    push rax        ; [+0]   syscall number (C handler will put return val here)
-    push r10        ; [+8]   arg4
-    push r9         ; [+16]  arg5
-    push r8         ; [+24]  arg6
-    push rdx        ; [+32]  arg3
-    push rsi        ; [+40]  arg2
-    push rdi        ; [+48]  arg1
-    push rbx        ; [+56]
-    push rbp        ; [+64]
-    push r12        ; [+72]
-    push r13        ; [+80]
-    push r14        ; [+88]
-    push r15        ; [+96]
-    push r11        ; [+104] user RFLAGS
+    ; --- Build the syscall frame (reverse of the frame-layout offsets) ---
+    ; The C handler indexes frame[i] = *(frame_ptr + 8*i) with the offsets
+    ; listed above (SC_OFF_RAX=0, SC_OFF_R10=8, ... SC_OFF_RCX=112).  That
+    ; means the rax slot must sit at the LOWEST address, i.e. rax is pushed
+    ; LAST.  Pushing rax first would place it at the highest address, and
+    ; frame[6] (RDI) would read 40 bytes above the save area (stale stack).
     push rcx        ; [+112] user RIP (return address for SYSRET)
+    push r11        ; [+104] user RFLAGS
+    push r15        ; [+96]
+    push r14        ; [+88]
+    push r13        ; [+80]
+    push r12        ; [+72]
+    push rbp        ; [+64]
+    push rbx        ; [+56]
+    push rdi        ; [+48]   arg1
+    push rsi        ; [+40]   arg2
+    push rdx        ; [+32]   arg3
+    push r8         ; [+24]   arg6
+    push r9         ; [+16]   arg5
+    push r10        ; [+8]    arg4
+    push rax        ; [+0]    syscall number (C handler puts return value here)
 
-    ; --- rdi = frame pointer (first argument for syscall_handler) ---
+    ; --- Point rdi at the frame base (rax slot, now the lowest address) ---
     mov rdi, rsp
-
-    ; --- Call the C dispatcher ---
     call syscall_handler
 
-    ; --- Restore r11 (RFLAGS) and rcx (RIP) from the frame ---
-    pop rcx         ; [+112] user RIP
-    pop r11         ; [+104] user RFLAGS
-
-    ; --- Restore general-purpose registers from the frame ---
-    pop r15         ; [+96]
-    pop r14         ; [+88]
-    pop r13         ; [+80]
-    pop r12         ; [+72]
-    pop rbp         ; [+64]
-    pop rbx         ; [+56]
-    pop rdi         ; [+48]  (overwritten, but keep stack balanced)
-    pop rsi         ; [+40]  (overwritten)
-    pop rdx         ; [+32]  (overwritten)
-    pop r8          ; [+24]  (overwritten)
-    pop r9          ; [+16]  (overwritten)
-    pop r10         ; [+8]   (overwritten)
+    ; --- Restore general-purpose registers (reverse of the push order) ---
     pop rax         ; [+0]   return value
+    pop r10         ; [+8]   (overwritten)
+    pop r9          ; [+16]  (overwritten)
+    pop r8          ; [+24]  (overwritten)
+    pop rdx         ; [+32]  (overwritten)
+    pop rsi         ; [+40]  (overwritten)
+    pop rdi         ; [+48]  (overwritten, but keep stack balanced)
+    pop rbx         ; [+56]
+    pop rbp         ; [+64]
+    pop r12         ; [+72]
+    pop r13         ; [+80]
+    pop r14         ; [+88]
+    pop r15         ; [+96]
+    pop r11         ; [+104] user RFLAGS
+    pop rcx         ; [+112] user RIP
 
-    ; --- Return to user mode ---
+    ; --- Restore user RSP, then return to user mode ---
+    ; MUST be the 64-bit operand-size SYSRET.  A bare `sysret` (0F 07)
+    ; returns to 32-bit compatibility mode: CS = STAR[63:48] = 0x13, EIP/ESP
+    ; truncated to 32 bits.  `o64 sysret` (REX.W, 48 0F 07) sets CS =
+    ; STAR[63:48]+16 = 0x23 and preserves full 64-bit RIP/RSP.  NOTE: NASM <
+    ; ~2.x does not know the AT&T mnemonic `sysretq` and would treat the line
+    ; as a label — use the explicit operand-size prefix instead.
+    mov rsp, qword [gs:8]
     swapgs
-    sysret
+    o64 sysret

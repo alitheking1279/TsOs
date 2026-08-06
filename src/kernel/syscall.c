@@ -12,9 +12,18 @@
 #include "slab.h"
 #include "elf.h"
 #include "../drivers/serial.h"
+#include "../drivers/pit.h"
+#include "../drivers/ps2.h"
+#include "../drivers/vga.h"
+#include "../drivers/pcspk.h"
+#include "../drivers/portio.h"
 #include "../fs/ext2.h"
 #include "../fs/vfs.h"
+#include "../fs/bcache.h"
 #include "../kernel/kheap.h"
+#include "../kernel/timer.h"
+#include "pmm.h"
+#include <sys/stat.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -30,9 +39,6 @@ static serial_dev_t *g_sc_serial = NULL;
 /** Address of the syscall_entry trampoline (from syscall_entry.asm). */
 extern void syscall_entry(void);
 uint64_t syscall_entry_addr;
-
-/** User-mode entry point (from user_main.c). */
-extern void user_task_entry(void);
 
 /* =========================================================================
  * Per-CPU RSP management
@@ -60,17 +66,27 @@ void syscall_init(void *serial_dev) {
 
     sc_log("[SYSCALL] Initializing SYSCALL/SYSRET...\r\n");
 
-    /* Set GS-base to point to per_cpu_data so syscall_entry can read
-     * the kernel stack pointer via GS:[0]. */
+    /* Set KERNEL_GS_BASE to point to per_cpu_data so syscall_entry can
+     * swapgs and read the kernel stack pointer via GS:[0].  SWAPGS swaps
+     * MSR_GS_BASE with MSR_KERNEL_GS_BASE — the kernel base must live in
+     * KERNEL_GS_BASE, and user-mode GS must be zero/controlled. */
     uint64_t gs_base = (uint64_t)&g_per_cpu;
-    write_msr(MSR_GS_BASE, gs_base);
+    write_msr(MSR_KERNEL_GS_BASE, gs_base);
 
     /* STAR register:
-     *   bits [63:48] = user CS selector (0x1B = GDT index 3, RPL 3)
-     *   bits [47:32] = kernel CS selector (0x08 = GDT index 1, RPL 0)
-     *   bits [31:0]  = kernel SS, user SS (derived by CPU from CS selectors) */
+     *   bits [63:48] = SYSRET selector base.  The CPU derives the user
+     *                  selectors from this base: SYSRET loads CS = base+16
+     *                  and SS = base+8 (Intel SDM Vol.3A §3.3.1).  To land
+     *                  on the user segments the data descriptor must sit one
+     *                  GDT index below the code descriptor (see gdt.h), so
+     *                  base = GDT_USER_CS_SEL - 16 = 0x13:
+     *                    SYSRET SS = 0x1B (GDT[3] user data), CS = 0x23 (GDT[4])
+     *   bits [47:32] = SYSCALL CS selector (0x08 = GDT[1]); the CPU derives
+     *                  SYSCALL SS as CS+8 = 0x10 (GDT[2] kernel data).
+     *   bits [31:0]  = reserved (must be zero).
+     */
     uint64_t star_val = 0;
-    star_val |= (uint64_t)GDT_USER_CS_SEL  << 48;
+    star_val |= (uint64_t)(GDT_USER_CS_SEL - 16) << 48;
     star_val |= (uint64_t)GDT_KERNEL_CS_SEL << 32;
     write_msr(MSR_STAR, star_val);
 
@@ -132,8 +148,9 @@ int validate_user_pointer(const void *ptr, size_t size) {
          addr < end;
          addr += PAGE_SIZE) {
         uint64_t pte = get_pte_flags(addr);
-        if (!(pte & PTE_PRESENT)) return 0;
-        if (!(pte & PTE_USER))    return 0;
+        if (!(pte & PTE_PRESENT) || !(pte & PTE_USER)) {
+            return 0;
+        }
     }
     return 1;
 }
@@ -596,7 +613,7 @@ static int64_t sys_fstat(uint64_t *frame) {
     int fd = (int)frame[SC_OFF_RDI / 8];
     void *user_buf = (void *)frame[SC_OFF_RSI / 8];
 
-    if (!validate_user_pointer(user_buf, sizeof(ext2_stat_t))) return -1;
+    if (!validate_user_pointer(user_buf, sizeof(struct stat))) return -1;
 
     task_t *cur = task_get_current();
     if (!cur || fd < 0 || fd >= TASK_MAX_FDS) return -1;
@@ -609,7 +626,25 @@ static int64_t sys_fstat(uint64_t *frame) {
     ext2_stat_t st;
     if (ext2_stat(file->ino, &st) != EXT2_OK) return -1;
 
-    memcpy(user_buf, &st, sizeof(ext2_stat_t));
+    /* Translate the native ext2_stat_t into the POSIX struct stat layout
+     * used by userspace (src/libc/include/sys/stat.h). */
+    struct stat out;
+    memset(&out, 0, sizeof(out));
+    out.st_dev     = 0;
+    out.st_ino     = st.ino;
+    out.st_mode    = st.mode;
+    out.st_nlink   = st.links;
+    out.st_uid     = st.uid;
+    out.st_gid     = st.gid;
+    out.st_rdev    = 0;
+    out.st_size    = st.size;
+    out.st_blksize = 512;
+    out.st_blocks  = st.blocks;
+    out.st_atime   = st.atime;
+    out.st_mtime   = st.mtime;
+    out.st_ctime   = st.ctime;
+
+    memcpy(user_buf, &out, sizeof(out));
     return 0;
 }
 
@@ -695,6 +730,255 @@ static int64_t sys_rename(uint64_t *frame) {
 }
 
 /* =========================================================================
+ * usleep — busy-wait for given microseconds
+ * ========================================================================= */
+
+static int64_t sys_usleep(uint64_t *frame) {
+    uint64_t usec = frame[SC_OFF_RDI / 8];
+    if (usec == 0) return 0;
+
+    /* Convert microseconds to ticks (1 tick = 10 ms = 10000 usec).
+     * Always wait at least 1 tick for non-zero requests. */
+    uint64_t start = timer_get_ticks();
+    uint64_t ticks_per_sec = 100;  /* PIT_DEFAULT_FREQ */
+    uint64_t target_ticks = (usec * ticks_per_sec) / 1000000;
+    if (target_ticks == 0) target_ticks = 1;
+
+    while ((timer_get_ticks() - start) < target_ticks) {
+        __asm__ volatile ("hlt");
+    }
+    return 0;
+}
+
+/* =========================================================================
+ * gettimeofday — convert monotonic ticks to struct timeval
+ * ========================================================================= */
+
+static int64_t sys_gettimeofday(uint64_t *frame) {
+    uint64_t tv_addr = frame[SC_OFF_RDI / 8];
+
+    if (tv_addr != 0) {
+        if (!validate_user_pointer((void *)tv_addr, 16)) return -1;
+
+        /* PIT runs at 100 Hz → 1 tick = 10 ms = 10000 usec. */
+        uint64_t ticks = timer_get_ticks();
+        long sec  = (long)(ticks / 100);
+        long usec = (long)((ticks % 100) * 10000);
+
+        long *tv = (long *)tv_addr;
+        tv[0] = sec;
+        tv[1] = usec;
+    }
+    return 0;
+}
+
+/* =========================================================================
+ * mkdir / rmdir — Directory creation/removal (stubs for shell support)
+ * ========================================================================= */
+
+static int64_t sys_mkdir(uint64_t *frame) {
+    const char *user_path = (const char *)frame[SC_OFF_RDI / 8];
+    uint64_t mode         = frame[SC_OFF_RSI / 8];
+    if (!validate_user_string(user_path, EXT2_MAX_PATH)) return -1;
+
+    char kpath[EXT2_MAX_PATH];
+    const char *src = user_path;
+    int i = 0;
+    while (src[i] && i < EXT2_MAX_PATH - 1) { kpath[i] = src[i]; i++; }
+    kpath[i] = '\0';
+
+    return (int64_t)vfs_mkdir(kpath, (uint32_t)mode);
+}
+
+static int64_t sys_rmdir(uint64_t *frame) {
+    const char *user_path = (const char *)frame[SC_OFF_RDI / 8];
+    if (!validate_user_string(user_path, EXT2_MAX_PATH)) return -1;
+
+    char kpath[EXT2_MAX_PATH];
+    const char *src = user_path;
+    int i = 0;
+    while (src[i] && i < EXT2_MAX_PATH - 1) { kpath[i] = src[i]; i++; }
+    kpath[i] = '\0';
+
+    return (int64_t)vfs_rmdir(kpath);
+}
+
+/* =========================================================================
+ * get_key — Read keyboard scancode from PS/2 driver
+ * ========================================================================= */
+
+static int64_t sys_get_key(uint64_t *frame) {
+    (void)frame;
+    return (int64_t)ps2_get_key();
+}
+
+/* =========================================================================
+ * VGA syscalls — kernel-side VGA operations for userspace shell
+ * ========================================================================= */
+
+static int64_t sys_vga_write(uint64_t *frame) {
+    const char *buf = (const char *)frame[SC_OFF_RDI / 8];
+    uint64_t count  = frame[SC_OFF_RSI / 8];
+    if (!validate_user_pointer(buf, count)) return -1;
+    for (uint64_t i = 0; i < count; i++) {
+        vga_put_str(vga_get_cursor_x(), vga_get_cursor_y(), (char[]){
+            buf[i], '\0'}, vga_get_color());
+    }
+    return (int64_t)count;
+}
+
+static int64_t sys_vga_clear(uint64_t *frame) {
+    (void)frame;
+    vga_clear();
+    return 0;
+}
+
+static int64_t sys_vga_set_color(uint64_t *frame) {
+    uint8_t fg = (uint8_t)frame[SC_OFF_RDI / 8];
+    uint8_t bg = (uint8_t)frame[SC_OFF_RSI / 8];
+    if (fg > 15 || bg > 15) return -1;
+    vga_set_color(fg, bg);
+    return 0;
+}
+
+static int64_t sys_beep(uint64_t *frame) {
+    uint32_t freq = (uint32_t)frame[SC_OFF_RDI / 8];
+    uint32_t dur  = (uint32_t)frame[SC_OFF_RSI / 8];
+    pcspk_beep(freq, dur);
+    return 0;
+}
+
+static int64_t sys_reboot(uint64_t *frame) {
+    (void)frame;
+    /* Flush write-back cache so files survive the reset. */
+    bcache_flush_all();
+    /* Triple fault reboot via keyboard controller. */
+    uint8_t good = 0x02;
+    while (good & 0x02)
+        good = inb(0x64);
+    outb(0x64, 0xFE);
+    while (1) { asm volatile ("hlt"); }
+    return 0;
+}
+
+static int64_t sys_vga_cursor_left(uint64_t *frame) {
+    (void)frame;
+    int x = vga_get_cursor_x();
+    int y = vga_get_cursor_y();
+    if (x > 0) vga_cursor_set(x - 1, y);
+    else if (y > 0) vga_cursor_set(VGA_WIDTH - 1, y - 1);
+    return 0;
+}
+
+static int64_t sys_vga_cursor_right(uint64_t *frame) {
+    (void)frame;
+    int x = vga_get_cursor_x();
+    int y = vga_get_cursor_y();
+    if (x < VGA_WIDTH - 1) vga_cursor_set(x + 1, y);
+    else if (y < VGA_HEIGHT - 1) vga_cursor_set(0, y + 1);
+    return 0;
+}
+
+static int64_t sys_vga_backspace(uint64_t *frame) {
+    (void)frame;
+    int x = vga_get_cursor_x();
+    int y = vga_get_cursor_y();
+    if (x == 0 && y == 0) return 0;
+    if (x > 0) x--;
+    else { x = VGA_WIDTH - 1; y--; }
+    vga_put_char(x, y, ' ', vga_get_color());
+    vga_cursor_set(x, y);
+    vga_flush();
+    return 0;
+}
+
+static int64_t sys_vga_insert_char(uint64_t *frame) {
+    char c = (char)frame[SC_OFF_RDI / 8];
+    int x = vga_get_cursor_x();
+    int y = vga_get_cursor_y();
+    uint8_t color = vga_get_color();
+    vga_put_char(x, y, c, color);
+    vga_cursor_set(x + 1, y);
+    return 0;
+}
+
+static int64_t sys_vga_get_cursor(uint64_t *frame) {
+    (void)frame;
+    return (int64_t)((uint32_t)vga_get_cursor_x() |
+                     ((uint32_t)vga_get_cursor_y() << 16));
+}
+
+static int64_t sys_vga_set_cursor(uint64_t *frame) {
+    int x = (int)frame[SC_OFF_RDI / 8];
+    int y = (int)frame[SC_OFF_RSI / 8];
+    if (x < 0 || x >= VGA_WIDTH || y < 0 || y >= VGA_HEIGHT) return -1;
+    vga_cursor_set(x, y);
+    return 0;
+}
+
+static int64_t sys_vga_put_char(uint64_t *frame) {
+    int x = (int)frame[SC_OFF_RDI / 8];
+    int y = (int)frame[SC_OFF_RSI / 8];
+    char c = (char)frame[SC_OFF_RDX / 8];
+    uint8_t color = (uint8_t)frame[SC_OFF_R10 / 8];
+    if (x < 0 || x >= VGA_WIDTH || y < 0 || y >= VGA_HEIGHT) return -1;
+    vga_put_char(x, y, c, color);
+    vga_flush_cell(x, y);
+    return 0;
+}
+
+static int64_t sys_vga_scroll(uint64_t *frame) {
+    int lines = (int)frame[SC_OFF_RDI / 8];
+    if (lines <= 0) return -1;
+    vga_scroll(lines);
+    vga_flush();
+    return 0;
+}
+
+static int64_t sys_vga_cursor_enable(uint64_t *frame) {
+    uint8_t start = (uint8_t)frame[SC_OFF_RDI / 8];
+    uint8_t end   = (uint8_t)frame[SC_OFF_RSI / 8];
+    vga_cursor_enable(start, end);
+    return 0;
+}
+
+static int64_t sys_uptime(uint64_t *frame) {
+    (void)frame;
+    return (int64_t)timer_get_ticks();
+}
+
+static int64_t sys_sysinfo(uint64_t *frame) {
+    sysinfo_t *user = (sysinfo_t *)frame[SC_OFF_RDI / 8];
+    if (!validate_user_pointer(user, sizeof(sysinfo_t))) return -1;
+
+    pmm_stats_t ps;
+    pmm_get_stats(&ps);
+
+    sysinfo_t info;
+    info.mem_total    = ps.total_frames    * PAGE_SIZE;
+    info.mem_free     = ps.free_frames     * PAGE_SIZE;
+    info.mem_used     = ps.used_frames     * PAGE_SIZE;
+    info.mem_reserved = ps.reserved_frames * PAGE_SIZE;
+    info.task_count   = scheduler_get_task_count();
+    info.uptime_ticks = timer_get_ticks();
+
+    memcpy(user, &info, sizeof(sysinfo_t));
+    return 0;
+}
+
+static int64_t sys_shutdown(uint64_t *frame) {
+    (void)frame;
+    /* Flush write-back cache so pending disk writes survive the reset. */
+    bcache_flush_all();
+    /* ACPI power button — QEMU i440fx PM1a control port. */
+    outw(0x604, 0x2000);
+    /* Fallback: q35 PM port, then halt forever. */
+    outw(0xB004, 0x2000);
+    while (1) { asm volatile ("hlt"); }
+    return -1;
+}
+
+/* =========================================================================
  * Dispatch table
  * ========================================================================= */
 
@@ -719,6 +1003,28 @@ static syscall_fn_t syscall_table[] = {
     [SYS_UNLINK]  = sys_unlink,
     [SYS_GETDENTS]= sys_getdents,
     [SYS_RENAME]  = sys_rename,
+    [SYS_USLEEP]  = sys_usleep,
+    [SYS_GETTIMEOFDAY] = sys_gettimeofday,
+    [SYS_MKDIR]        = sys_mkdir,
+    [SYS_RMDIR]        = sys_rmdir,
+    [SYS_GET_KEY]      = sys_get_key,
+    [SYS_VGA_WRITE]    = sys_vga_write,
+    [SYS_VGA_CLEAR]    = sys_vga_clear,
+    [SYS_VGA_SET_COLOR]= sys_vga_set_color,
+    [SYS_BEEP]         = sys_beep,
+    [SYS_REBOOT]       = sys_reboot,
+    [SYS_VGA_CURSOR_LEFT]  = sys_vga_cursor_left,
+    [SYS_VGA_CURSOR_RIGHT] = sys_vga_cursor_right,
+    [SYS_VGA_BACKSPACE]    = sys_vga_backspace,
+    [SYS_VGA_INSERT_CHAR]  = sys_vga_insert_char,
+    [SYS_VGA_GET_CURSOR]   = sys_vga_get_cursor,
+    [SYS_VGA_SET_CURSOR]   = sys_vga_set_cursor,
+    [SYS_VGA_PUT_CHAR]     = sys_vga_put_char,
+    [SYS_VGA_SCROLL]       = sys_vga_scroll,
+    [SYS_VGA_CURSOR_ENABLE]= sys_vga_cursor_enable,
+    [SYS_UPTIME]           = sys_uptime,
+    [SYS_SYSINFO]          = sys_sysinfo,
+    [SYS_SHUTDOWN]         = sys_shutdown,
 };
 
 /* =========================================================================
