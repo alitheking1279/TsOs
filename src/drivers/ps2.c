@@ -600,7 +600,9 @@ void ps2_init(void *serial_dev) {
     config &= ~(1 << 1);  /* Disable IRQ12 (mouse). */
     config &= ~(1 << 4);  /* Enable keyboard (clear disable bit!). */
     config &= ~(1 << 5);  /* Enable mouse (clear disable bit). */
-    config &= ~(1 << 6);  /* Disable scancode translation — we handle Set 1 at keyboard, not controller. */
+    config &= ~(1 << 6);  /* Disable scancode translation — we handle Set 1 at keyboard, not controller.
+                            * QEMU honors the 0xF0 0x01 Set1 selection below, so the controller
+                            * must NOT re-translate (that would double-translate Set 1 → garbage). */
 
     /* Write command byte (0x60 → port 0x64, then config → port 0x60). */
     ser_log("[PS2] Write config byte (0x60): 0x");

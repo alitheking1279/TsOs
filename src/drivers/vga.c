@@ -34,6 +34,7 @@
 #define VGA_CRT_CURSOR_LOW  0x0F
 
 static uint16_t g_shadow[VGA_WIDTH * VGA_HEIGHT];
+static uint8_t g_dirty[VGA_WIDTH * VGA_HEIGHT];   /* dirty-cell bitmap */
 static uint8_t g_fg = VGA_DEFAULT_FG;
 static uint8_t g_bg = VGA_DEFAULT_BG;
 static volatile uint16_t *g_vga_mem = NULL;
@@ -64,6 +65,7 @@ void vga_init(void) {
                  VGA_TEXT_MEMORY,
                  VMM_FLAG_WRITE | VMM_FLAG_NOEXEC | VMM_FLAG_CACHE_DIS);
     g_vga_mem = (volatile uint16_t *)(VGA_DIRECT_OFFSET + VGA_TEXT_MEMORY);
+    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) g_dirty[i] = 0;
     vga_clear();
 }
 
@@ -71,6 +73,7 @@ void vga_clear(void) {
     uint16_t blank = vga_entry(' ', vga_make_color(g_fg, g_bg));
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
         g_shadow[i] = blank;
+        g_dirty[i] = 1;   /* mark all dirty so next flush writes everything */
     }
     g_cursor_x = 0;
     g_cursor_y = 0;
@@ -80,8 +83,13 @@ void vga_clear(void) {
 
 char vga_put_char(int x, int y, char c, uint8_t color) {
     if (x < 0 || x >= VGA_WIDTH || y < 0 || y >= VGA_HEIGHT) return 0;
-    uint16_t old = g_shadow[y * VGA_WIDTH + x];
-    g_shadow[y * VGA_WIDTH + x] = vga_entry(c, color);
+    int idx = y * VGA_WIDTH + x;
+    uint16_t entry = vga_entry(c, color);
+    uint16_t old = g_shadow[idx];
+    if (g_shadow[idx] != entry) {
+        g_shadow[idx] = entry;
+        g_dirty[idx] = 1;   /* mark cell dirty for next flush */
+    }
     return (char)(old & 0xFF);
 }
 
@@ -98,12 +106,18 @@ void vga_put_str(int x, int y, const char *s, uint8_t color) {
         if (*s == '\n') { cx = 0; cy++; s++; continue; }
         if (*s == '\r') { cx = 0; s++; continue; }
         if (*s == '\t') { cx = (cx + 8) & ~7; s++; continue; }
-        g_shadow[cy * VGA_WIDTH + cx] = vga_entry(*s, color);
+        int idx = cy * VGA_WIDTH + cx;
+        uint16_t entry = vga_entry(*s, color);
+        if (g_shadow[idx] != entry) {
+            g_shadow[idx] = entry;
+            g_dirty[idx] = 1;
+        }
         cx++;
         s++;
     }
     g_cursor_x = cx;
     g_cursor_y = cy;
+    update_cursor(cx, cy);   /* sync hardware cursor — was missing, caused displaced cursor */
     vga_flush();
 }
 
@@ -123,12 +137,14 @@ void vga_scroll(int lines) {
         return;
     }
 
-    int copied = (VGA_HEIGHT - lines) * VGA_WIDTH;
-    memmove(g_shadow, &g_shadow[lines * VGA_WIDTH], copied * sizeof(uint16_t));
+    int kept = (VGA_HEIGHT - lines) * VGA_WIDTH;
+    memmove(g_shadow, &g_shadow[lines * VGA_WIDTH], kept * sizeof(uint16_t));
+    memmove(g_dirty,  &g_dirty[lines * VGA_WIDTH],  kept);
 
     uint16_t blank = vga_entry(' ', vga_make_color(g_fg, g_bg));
-    for (int i = copied; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+    for (int i = kept; i < VGA_WIDTH * VGA_HEIGHT; i++) {
         g_shadow[i] = blank;
+        g_dirty[i] = 1;
     }
 }
 
@@ -154,15 +170,30 @@ void vga_cursor_set(int x, int y) {
 
 void vga_flush(void) {
     if (!g_vga_mem || g_batch_mode) return;
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        g_vga_mem[i] = g_shadow[i];
+    /* Dirty-cell optimized flush: only write cells that changed.
+     * Falls back to full memcpy when >75% of cells are dirty (bulk redraws). */
+    int dirty_count = 0;
+    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) dirty_count += g_dirty[i];
+
+    if (dirty_count >= (VGA_WIDTH * VGA_HEIGHT * 3 / 4)) {
+        /* Bulk: single memcpy is faster than scattered writes when mostly dirty */
+        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) g_vga_mem[i] = g_shadow[i];
+    } else {
+        /* Sparse: only write dirty cells */
+        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+            if (g_dirty[i]) g_vga_mem[i] = g_shadow[i];
+        }
     }
+    /* Clear dirty bitmap after flush */
+    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) g_dirty[i] = 0;
 }
 
 void vga_flush_cell(int x, int y) {
     if (!g_vga_mem || g_batch_mode) return;
     if (x < 0 || x >= VGA_WIDTH || y < 0 || y >= VGA_HEIGHT) return;
-    g_vga_mem[y * VGA_WIDTH + x] = g_shadow[y * VGA_WIDTH + x];
+    int idx = y * VGA_WIDTH + x;
+    g_vga_mem[idx] = g_shadow[idx];
+    g_dirty[idx] = 0;
 }
 
 void vga_batch_start(void) {
@@ -172,8 +203,10 @@ void vga_batch_start(void) {
 void vga_batch_end(void) {
     g_batch_mode = false;
     if (g_vga_mem) {
+        /* After batch: bulk-write all cells (full redraw context) */
         for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
             g_vga_mem[i] = g_shadow[i];
+            g_dirty[i] = 0;
         }
     }
 }

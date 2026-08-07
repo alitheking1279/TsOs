@@ -819,11 +819,37 @@ static int64_t sys_get_key(uint64_t *frame) {
 static int64_t sys_vga_write(uint64_t *frame) {
     const char *buf = (const char *)frame[SC_OFF_RDI / 8];
     uint64_t count  = frame[SC_OFF_RSI / 8];
+    if (count == 0) return 0;
     if (!validate_user_pointer(buf, count)) return -1;
+
+    /* Process every character into the shadow buffer in one pass,
+     * then do a single vga_flush() at the end.  This replaces the
+     * previous loop that called vga_put_str (which flushed all 4000
+     * cells) once per character — catastrophically slow. */
+    int x = vga_get_cursor_x();
+    int y = vga_get_cursor_y();
+    uint8_t color = vga_get_color();
+
     for (uint64_t i = 0; i < count; i++) {
-        vga_put_str(vga_get_cursor_x(), vga_get_cursor_y(), (char[]){
-            buf[i], '\0'}, vga_get_color());
+        char c = buf[i];
+        if (c == '\r') {
+            x = 0;
+        } else if (c == '\n') {
+            x = 0; y++;
+            if (y >= VGA_HEIGHT) { vga_scroll(1); y = VGA_HEIGHT - 1; }
+        } else if (c == '\t') {
+            x = (x + 8) & ~7;
+            if (x >= VGA_WIDTH) { x = 0; y++; }
+        } else {
+            if (x >= VGA_WIDTH) { x = 0; y++; }
+            if (y >= VGA_HEIGHT) { vga_scroll(1); y = VGA_HEIGHT - 1; }
+            vga_put_char(x, y, c, color);
+            x++;
+        }
     }
+    /* Single MMIO flush for the whole string. */
+    vga_flush();
+    vga_cursor_set(x, y);
     return (int64_t)count;
 }
 
@@ -887,8 +913,8 @@ static int64_t sys_vga_backspace(uint64_t *frame) {
     if (x > 0) x--;
     else { x = VGA_WIDTH - 1; y--; }
     vga_put_char(x, y, ' ', vga_get_color());
+    vga_flush_cell(x, y);   /* single-cell flush — was full 4000-byte flush */
     vga_cursor_set(x, y);
-    vga_flush();
     return 0;
 }
 
@@ -898,7 +924,11 @@ static int64_t sys_vga_insert_char(uint64_t *frame) {
     int y = vga_get_cursor_y();
     uint8_t color = vga_get_color();
     vga_put_char(x, y, c, color);
-    vga_cursor_set(x + 1, y);
+    vga_flush_cell(x, y);   /* flush this cell — was missing, so typed chars never appeared */
+    x++;
+    if (x >= VGA_WIDTH) { x = 0; y++; }
+    if (y >= VGA_HEIGHT) { vga_scroll(1); vga_flush(); y = VGA_HEIGHT - 1; }
+    vga_cursor_set(x, y);
     return 0;
 }
 

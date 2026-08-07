@@ -90,10 +90,14 @@ static inline long __syscall3(long num, long a1, long a2, long a3) {
 
 static inline long __syscall4(long num, long a1, long a2, long a3, long a4) {
     long ret;
+    /* arg4 must arrive in R10: the kernel's syscall_entry.asm frame reads
+     * arg4 from SC_OFF_R10 (+8).  A bare "r" constraint lets GCC pick any
+     * register (often R8), so the kernel reads garbage.  Pin it explicitly. */
+    register long r10 __asm__("r10") = a4;
     __asm__ volatile (
         "syscall"
         : "=a"(ret)
-        : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(a4)
+        : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
         : "rcx", "r11", "memory"
     );
     return ret;
@@ -102,14 +106,15 @@ static inline long __syscall4(long num, long a1, long a2, long a3, long a4) {
 static inline long __syscall6(long num, long a1, long a2, long a3,
                                long a4, long a5, long a6) {
     long ret;
+    /* Kernel ABI (syscall_entry.asm): arg4=R10, arg5=R9, arg6=R8. */
     register long r10 __asm__("r10") = a4;
-    register long r8  __asm__("r8")  = a5;
-    register long r9  __asm__("r9")  = a6;
+    register long r9  __asm__("r9")  = a5;
+    register long r8  __asm__("r8")  = a6;
     __asm__ volatile (
         "syscall"
         : "=a"(ret)
         : "a"(num), "D"(a1), "S"(a2), "d"(a3),
-          "r"(r10), "r"(r8), "r"(r9)
+          "r"(r10), "r"(r9), "r"(r8)
         : "rcx", "r11", "memory"
     );
     return ret;

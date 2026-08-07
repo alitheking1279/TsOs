@@ -179,6 +179,11 @@ void scheduler_tick(interrupt_frame_t *frame) {
     task_t *next = mlfq_pick_highest();
     if (!next) {
         next = g_idle_task;
+        if (prev != g_idle_task) {
+            sched_log("[SCHED] DBG: MLFQ empty, fallback to idle (prev PID=");
+            sched_log_hex(prev->pid);
+            sched_log(")\r\n");
+        }
     }
 
     /* If the next task is the same as the current, no switch needed.
@@ -222,6 +227,15 @@ void scheduler_tick(interrupt_frame_t *frame) {
     }
 
     /* Perform the context switch! */
+    sched_log("[SCHED] DBG: switch PID=");
+    sched_log_hex(prev->pid);
+    sched_log("(L");
+    sched_log_u64(prev->mlfq_level);
+    sched_log(") -> PID=");
+    sched_log_hex(next->pid);
+    sched_log("(L");
+    sched_log_u64(next->mlfq_level);
+    sched_log(")\r\n");
     context_switch(prev, next);
 
     /* We are back on prev.  Restore the current-task pointer. */

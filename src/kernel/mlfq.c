@@ -157,9 +157,12 @@ void mlfq_decay(task_t *task) {
 
     int current_level = task->mlfq_level;
     if (current_level >= MLFQ_LEVELS - 1) {
-        /* Already at lowest level — just reload quantum. */
-        task->remaining_ticks = mlfq_quanta[current_level];
-        task->time_slice = mlfq_quanta[current_level];
+        /* Already at lowest level — reload quantum and rotate to the tail
+         * of the L3 queue.  scheduler_tick() dequeues a task when it is
+         * picked to run, so without re-enqueueing here the task would be
+         * lost from every queue on its next L3 quantum expiry (orphan). */
+        mlfq_dequeue(task);
+        mlfq_enqueue(task, current_level);
         return;
     }
 
